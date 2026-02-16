@@ -48,5 +48,7 @@ This project is adapted from a prior year's CS 224N
 project [Implement BERT](https://web.stanford.edu/class/archive/cs/cs224n/cs224n.1246/project/default-final-project-handout-minbert-spr2024-updated.pdf)
 .
 
+References: https://web.stanford.edu/class/cs224n/project/DFP_Instructions.pdf
+
 Parts of the code are from the [`transformers`](https://github.com/huggingface/transformers)
 library ([Apache License 2.0](./LICENSE)).
