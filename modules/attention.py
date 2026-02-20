@@ -34,7 +34,7 @@ class CausalSelfAttention(nn.Module):
   def attention(self, key, query, value, attention_mask):
 
     ### YOUR CODE HERE
-    raise NotImplementedError
+    return nn.functional.scaled_dot_product_attention(query,key,value,attention_mask)
 
 
   def forward(self, hidden_states, attention_mask):
