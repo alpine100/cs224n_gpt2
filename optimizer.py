@@ -57,11 +57,25 @@ class AdamW(Optimizer):
                 ###          (using the "efficient version" given in https://arxiv.org/abs/1412.6980;
                 ###          also given in the pseudo-code in the project description).
                 ###       3. Update parameters (p.data).
-                ###       4. Apply weight decay after the main gradient-based updates.
+                ###       4. Apply weight decay (theta*(1-lambda)) after the main gradient-based updates.
                 ###
                 ###       Refer to the default project handout for more details.
                 ### YOUR CODE HERE
-                raise NotImplementedError
+                if len(state) == 0:
+                    state['m'] = torch.zeros_like(p.data)
+                    state['v'] = torch.zeros_like(p.data)
+                    state['t'] = 0
+                
+                state['t'] += 1
+                m, v = state['m'], state['v']
+                beta1, beta2 = group['betas']
+                m.multiply_(beta1).add_(grad,alpha=1-beta1)
+                v.multiply_(beta2).addcmul_(grad,grad,value=1-beta2)
+                beta1_exp, beta2_exp = (1 - beta1**state['t']), (1 - beta2**state['t'])
+                if group['correct_bias']:
+                    alpha *= (math.sqrt(beta2_exp)/beta1_exp)
+                p.data.addcdiv_(m,torch.sqrt(v).add_(group['eps']),value=-alpha)
+                p.data.multiply_(1 - (alpha*group['weight_decay']))
 
 
         return loss
