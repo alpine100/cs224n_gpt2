@@ -30,9 +30,14 @@ class GPT2Layer(nn.Module):
         IN THIS FUNCTION.
     """
     ### YOUR CODE HERE
-    return input + dropout(dense_layer(output))
-
+    # apply dense projection layer
+    transformed_output = dense_layer(output)
     
+    # apply dropout
+    dropped_output = dropout(transformed_output)
+    
+    # add to the original input aka residual connection
+    return input + dropped_output
 
 
   def forward(self, hidden_states, attention_mask):
@@ -45,19 +50,25 @@ class GPT2Layer(nn.Module):
     """
 
     ### YOUR CODE HERE
-    # 1 layer --> multiheaded attention --> add & layer norm --> ff --> add & norm
+    # apply layer norm bc prenorm has better convergence and training stability
+    normed_attn_input = self.attention_layer_norm(hidden_states)
+    
+    # compute self-attention
+    attn_output = self.self_attention(normed_attn_input, attention_mask)
+    
+    # apply dense, dropout, and residual connection using add
+    attention_output = self.add(hidden_states, attn_output, self.attention_dense, self.attention_dropout)
 
-    #masked attention
-    attention = self.self_attention(hidden_states,attention_mask)
-    #add and norm 1
-    add1 = self.add(hidden_states,attention,self.attention_dense,self.attention_dropout)
-    norm1 = self.attention_layer_norm(add1)
-    #ff
-    interm = self.interm_dense(norm1)
-    #add and norm 2
-    add2 = self.add(norm1,interm,self.out_dense,self.out_dropout)
-    norm2 = self.out_layer_norm(add2)
+    # apply layer norm before ff
+    normed_ff_input = self.out_layer_norm(attention_output)
+    
+    # compute feed forward, aka dense -> activation
+    interm_output = self.interm_dense(normed_ff_input)
+    ff_output = self.interm_af(interm_output)
+    
+    # apply dense, dropout, and residual connection using add
+    layer_output = self.add(attention_output, ff_output, self.out_dense, self.out_dropout)
 
-    return norm2
+    return layer_output
 
 
