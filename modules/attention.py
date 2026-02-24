@@ -34,7 +34,12 @@ class CausalSelfAttention(nn.Module):
   def attention(self, key, query, value, attention_mask):
 
     ### YOUR CODE HERE
-    return nn.functional.scaled_dot_product_attention(query,key,value,attention_mask)
+    attention_output = nn.functional.scaled_dot_product_attention(query, key, value, attention_mask)
+    
+    # convert from (bs, num_heads, seq_len, head_dim) to (bs, seq_len, hidden_size)
+    attention_output = rearrange(attention_output, 'b h t d -> b t (h d)')
+
+    return attention_output
 
 
   def forward(self, hidden_states, attention_mask):
