@@ -34,12 +34,22 @@ class CausalSelfAttention(nn.Module):
   def attention(self, key, query, value, attention_mask):
 
     ### YOUR CODE HERE
-    attention_output = nn.functional.scaled_dot_product_attention(query, key, value, attention_mask)
-    
-    # convert from (bs, num_heads, seq_len, head_dim) to (bs, seq_len, hidden_size)
-    attention_output = rearrange(attention_output, 'b h t d -> b t (h d)')
+    #check if nn.Module training attr is set before applying dropout
+    dropout_p = self.dropout.p if self.training else 0
 
-    return attention_output
+    #key positions (s)
+    S = key.size(-2)
+    causal_mask = torch.triu(torch.full((S, S), -10000.), diagonal=1) 
+    #attention_mask = causal mask (s,s) + padding(bs,h,query_positions,key_positions(s))
+    #                 add padding to respective cols in mask
+    resulting_mask = causal_mask + attention_mask
+
+    #attention_output = nn.functional.scaled_dot_product_attention(query, key, value, attention_mask, dropout_p=dropout_p)
+    attention_output = nn.functional.scaled_dot_product_attention(query, key, value, attn_mask=resulting_mask, dropout_p=dropout_p)
+    # convert from (bs, num_heads, seq_len, head_dim) to (bs, seq_len, hidden_size)
+    result = rearrange(attention_output, 'b h t d -> b t (h d)')
+
+    return result
 
 
   def forward(self, hidden_states, attention_mask):
