@@ -71,6 +71,7 @@ class ParaphraseGPT(nn.Module):
     """
 
     'Takes a batch of sentences and produces embeddings for them.'
+    attention_mask = attention_mask.to(input_ids.device)
     gpt_out = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
     last_hidden = gpt_out["last_token"]
     logits = self.gpt.hidden_state_to_token(last_hidden)
