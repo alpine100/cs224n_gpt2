@@ -153,7 +153,7 @@ def train(args):
 def test(args):
   """Evaluate your model on the dev and test datasets; save the predictions to disk."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(args.filepath)
+  saved = torch.load(args.filepath, weights_only=False)
 
   model = ParaphraseGPT(saved['args'])
   model.load_state_dict(saved['model'])
