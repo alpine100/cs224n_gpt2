@@ -40,9 +40,20 @@ class CausalSelfAttention(nn.Module):
     S = key.size(-2)
     # Create causal mask on the same device and with the same dtype as attention_mask
     causal_mask = torch.triu(torch.full((S, S), -10000.0, device=attention_mask.device, dtype=attention_mask.dtype), diagonal=1)
+    
+    # longformer mask 
+    window_size = 512 # cite
+    window_mask = torch.triu(torch.full((S, S), -10000.0, device=attention_mask.device, dtype=attention_mask.dtype), diagonal=-window_size)
+    
+    # combine masks together
+    longformer_mask = causal_mask + window_mask
+
+    # longformer global attention
+    resulting_mask = longformer_mask + attention_mask
+
     # attention_mask = causal mask (s,s) + padding(bs,h,query_positions,key_positions(s))
     #                  add padding to respective cols in mask
-    resulting_mask = causal_mask + attention_mask
+    # resulting_mask = causal_mask + attention_mask
 
     attention_output = nn.functional.scaled_dot_product_attention(query, key, value, attn_mask=resulting_mask, dropout_p=dropout_p)
     
