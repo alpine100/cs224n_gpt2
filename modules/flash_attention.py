@@ -138,8 +138,108 @@ def fused_attn_fw(
     tl.store(lse_ptr + q_offset, m_i, mask=row_mask)
 
 @triton.jit
-def backpropt_attention_propagate():
-    pass
+def backpropt_attention_propagate(
+    Q, K, V, O, dO, dQ, dK, dV, LSE, Delta,
+    sm_scale,
+    B: tl.constexpr, H: tl.constexpr, S: tl.constexpr, Dh: tl.constexpr,
+    BLOCK_Q: tl.constexpr, BLOCK_KV: tl.constexpr
+):
+    # setup and outer loop over KV blocks
+    # instead of a for-loop, triton parallelizes the outer loop over the grid
+    # program ID 0 acts as our `j` index (1 <= j <= Tc)
+    kv_idx = tl.program_id(0)
+    bh_idx = tl.program_id(1)
+    
+    batch_idx = bh_idx // H
+    head_idx = bh_idx % H
+
+    batch_stride = H * S * Dh
+    head_stride = S * Dh
+    offset_bh = batch_idx * batch_stride + head_idx * head_stride
+
+    kv_offset = kv_idx * BLOCK_KV + tl.arange(0, BLOCK_KV)
+    dh_offset = tl.arange(0, Dh)
+
+    k_t_offsets = dh_offset[:, None] + kv_offset[None, :] * Dh
+    v_t_offsets = dh_offset[:, None] + kv_offset[None, :] * Dh
+    k_offsets = kv_offset[:, None] * Dh + dh_offset[None, :]
+    v_offsets = kv_offset[:, None] * Dh + dh_offset[None, :]
+
+    k_ptr = K + offset_bh
+    v_ptr = V + offset_bh
+    dk_ptr = dK + offset_bh
+    dv_ptr = dV + offset_bh
+
+    # load K_j, V_j from HBM to on-chip SRAM
+    k_mask = kv_offset < S
+    K_T = tl.load(k_ptr + k_t_offsets, mask=k_mask[None, :], other=0.0)
+    V_T = tl.load(v_ptr + v_t_offsets, mask=k_mask[None, :], other=0.0)
+    K_blk = tl.load(k_ptr + k_offsets, mask=k_mask[:, None], other=0.0)
+
+    # initialize dK_j = 0, dV_j = 0 on SRAM
+    dk = tl.zeros([BLOCK_KV, Dh], dtype=tl.float32)
+    dv = tl.zeros([BLOCK_KV, Dh], dtype=tl.float32)
+
+    # start index for causal masking, Q blocks before the current KV block 
+    start_q_idx = kv_idx * BLOCK_KV
+    lo = tl.multiple_of(start_q_idx, BLOCK_Q)
+
+    q_ptr = Q + offset_bh
+    do_ptr = dO + offset_bh
+    dq_ptr = dQ + offset_bh
+    
+    lse_ptr = LSE + (batch_idx * H + head_idx) * S
+    delta_ptr = Delta + (batch_idx * H + head_idx) * S
+
+    ln2 = 1.4426950408889634
+
+    # for 1 <= i <= Tr do
+    for q_offset_base in range(lo, S, BLOCK_Q):
+        q_offset_base = tl.multiple_of(q_offset_base, BLOCK_Q)
+        q_offset = q_offset_base + tl.arange(0, BLOCK_Q)
+        q_mask = q_offset < S
+
+        q_offsets = q_offset[:, None] * Dh + dh_offset[None, :]
+        
+        # load Q_i, O_i, dO_i, dQ_i, l_i, m_i from HBM to SRAM
+        q = tl.load(q_ptr + q_offsets, mask=q_mask[:, None], other=0.0)
+        do = tl.load(do_ptr + q_offsets, mask=q_mask[:, None], other=0.0)
+        lse = tl.load(lse_ptr + q_offset, mask=q_mask, other=0.0)
+        delta = tl.load(delta_ptr + q_offset, mask=q_mask, other=0.0)
+
+        # on chip, compute S_ij = tau * Q_i * K_j^T
+        s_ij = tl.dot(q, K_T) * sm_scale * ln2
+
+        # on chip, compute S_ij_masked = mask(S_ij)
+        causal_mask = q_offset[:, None] >= kv_offset[None, :]
+        s_ij = tl.where(causal_mask, s_ij, -1.0e6)
+
+        # on chip, compute P_ij = diag(l_i)^-1 exp(S_ij - m_i)
+        p_ij = tl.exp2(s_ij - lse[:, None])
+        p_ij = tl.where(causal_mask, p_ij, 0.0)
+
+        # on chip, compute dV_j <- dV_j + (P_ij)^T * dO_i
+        dv += tl.dot(tl.trans(p_ij.to(q.dtype)), do)
+
+        # on chip, compute dP_ij = dO_i * (V_j)^T
+        dp_ij = tl.dot(do, V_T)
+
+        # on chip, compute D_i = rowsum(dO_i * O_i)
+        # on chip, compute dS_ij = P_ij * (dP_ij - D_i)
+        ds_ij = p_ij * (dp_ij - delta[:, None])
+
+        # on chip, compute dK_j <- dK_j + tau * (dS_ij)^T * Q_i
+        dk += tl.dot(tl.trans(ds_ij.to(q.dtype)), q) * sm_scale
+
+        # write dQ_i <- dQ_i + tau * dS_ij * K_j to HBM
+        # since multiple KV loop blocks write to the same Q indices, 
+        # we must use tl.atomic_add to safely accumulate in HBM.
+        dq = tl.dot(ds_ij.to(q.dtype), K_blk) * sm_scale
+        tl.atomic_add(dq_ptr + q_offsets, dq, mask=q_mask[:, None])
+
+    # write dK_j <- dK_j, dV_j <- dV_j to HBM
+    tl.store(dk_ptr + k_offsets, dk.to(K_blk.dtype), mask=k_mask[:, None])
+    tl.store(dv_ptr + v_offsets, dv.to(K_blk.dtype), mask=k_mask[:, None])
 
 #compute 
 def forward_attention_compute(q, k, v, sm_scale, dtype=torch.float32):
@@ -178,10 +278,40 @@ def forward_attention_compute(q, k, v, sm_scale, dtype=torch.float32):
         BLOCK_Q=BLOCK_Q,
         BLOCK_KV=BLOCK_KV
     )
-    return O
+    return O, LSE
 
-def back_prop_attention_compute():
-    pass
+def back_prop_attention_compute(do, q, k, v, O, LSE, sm_scale):
+    do = do.contiguous()
+    q = q.contiguous()
+    k = k.contiguous()
+    v = v.contiguous()
+
+    B, H, S, Dh = q.shape
+
+    # dQ is initialized to zero because of the atomic_adds in the kernel
+    dQ = torch.zeros_like(q)
+    # dK and dV are fully overwritten so empty is fine
+    dK = torch.empty_like(k)
+    dV = torch.empty_like(v)
+
+    # precomputing D_i = rowsum(dO_i * O_i)
+    Delta = torch.sum(do * O, dim=-1).contiguous()
+
+    BLOCK_Q = 64 if S >= 64 else triton.next_power_of_2(S)
+    BLOCK_KV = BLOCK_Q
+
+    grid = (triton.cdiv(S, BLOCK_KV), B * H)
+    
+    backpropt_attention_propagate[grid](
+        q, k, v, O, do,
+        dQ, dK, dV,
+        LSE, Delta,
+        sm_scale,
+        B, H, S, Dh,
+        BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV
+    )
+    
+    return dQ, dK, dV
 
 #basic sanity test for FW pass
 def test_flash_attention_kernel(B=2, H=4, S=128, Dh=64, device=None, atol=5e-2, rtol=1e-2):
@@ -197,11 +327,47 @@ def test_flash_attention_kernel(B=2, H=4, S=128, Dh=64, device=None, atol=5e-2, 
     v = torch.randn((B, H, S, Dh), dtype=torch.float32, device=device)
 
     sm_scale = 1.0 / math.sqrt(Dh)
-    triton_out = forward_attention_compute(q, k, v, sm_scale)
+    triton_out, _ = forward_attention_compute(q, k, v, sm_scale)
     pytorch_out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm_scale)
 
     torch.testing.assert_close(triton_out, pytorch_out, atol=atol, rtol=rtol)
     print(f"passed fwd: B={B}, H={H}, S={S}, Dh={Dh}, dtype={q.dtype}")
+
+#basic sanity test for BW pass
+def test_flash_attention_backward(B=2, H=4, S=128, Dh=64, device=None):
+    if device is None:
+        device = torch.device("cuda")
+        
+    torch.manual_seed(0)
+    sm_scale = 1.0 / math.sqrt(Dh)
+    
+    # Create tensors and set requires_grad=True so PyTorch natively tracks them
+    q_pt = torch.randn((B, H, S, Dh), dtype=torch.float32, device=device, requires_grad=True)
+    k_pt = torch.randn((B, H, S, Dh), dtype=torch.float32, device=device, requires_grad=True)
+    v_pt = torch.randn((B, H, S, Dh), dtype=torch.float32, device=device, requires_grad=True)
+    
+    # Clone tensors for Triton. We don't need requires_grad=True here because we are 
+    # doing the math manually!
+    q_tr = q_pt.detach().clone()
+    k_tr = k_pt.detach().clone()
+    v_tr = v_pt.detach().clone()
+
+    # PyTorch Native Forward & Backward
+    out_pt = F.scaled_dot_product_attention(q_pt, k_pt, v_pt, is_causal=True, scale=sm_scale)
+    gO = torch.rand_like(out_pt) # Fake upstream gradient
+    out_pt.backward(gO)
+
+    # Triton Manual Forward & Backward
+    # 1. Run forward to get O and LSE
+    O_tr, LSE_tr = forward_attention_compute(q_tr, k_tr, v_tr, sm_scale)
+    # 2. Run backward using the fake gradient (gO) and the saved tensors
+    dQ_tr, dK_tr, dV_tr = back_prop_attention_compute(gO, q_tr, k_tr, v_tr, O_tr, LSE_tr, sm_scale)
+
+    # Compare gradients natively
+    torch.testing.assert_close(dQ_tr, q_pt.grad, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(dK_tr, k_pt.grad, atol=5e-2, rtol=1e-2)
+    torch.testing.assert_close(dV_tr, v_pt.grad, atol=5e-2, rtol=1e-2)
+    print("Passed backward pass gradients!")
 
 #map datatypes
 def _normalize_dtype(dtype):
@@ -243,7 +409,7 @@ def benchmark_flash_attention_kernel(S, provider, B=2, H=8, Dh=64, dtype=tl.floa
     sm_scale = 1.0 / math.sqrt(Dh)
 
     if provider == "triton":
-        fn = lambda: forward_attention_compute(q, k, v, sm_scale)
+        fn = lambda: forward_attention_compute(q, k, v, sm_scale)[0]
     else:
         fn = lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm_scale)
 
@@ -254,7 +420,7 @@ if __name__ == "__main__":
     #NOTE: this implementation is based on Flash Attention Original and Version 2
     #Sanity test for flash_attention_kernel forward pass
     test_flash_attention_kernel()
-    benchmark_flash_attention_kernel.run(show_plots=True, print_data=True, save_path="../output/plots")
     #Sanity test for flash_attention_kernel backwards pass
-    #TODO: back prop
-    #integrate with 
+    test_flash_attention_backward()
+    
+    benchmark_flash_attention_kernel.run(show_plots=True, print_data=True, save_path="../output/plots")
