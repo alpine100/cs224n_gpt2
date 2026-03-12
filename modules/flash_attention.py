@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+import pytest
 #from triton.tools.tensor_descriptor import TensorDescriptor
 
 #DEVICE = triton.runtime.driver.active.get_active_torch_function()
@@ -108,7 +109,7 @@ def fused_attn_fw(
 
     #final offsets, 2D for each tensor
     q_offsets           = q_offset [:, None] * Dh + dh_offset[None, :]       # [block_q_size, Dh]
-    k_t_offsets = dh_offset[:, None]      + kv_offset[None, :] * Dh  # [Dh, block_k_size]
+    k_t_offsets         = dh_offset[:, None]      + kv_offset[None, :] * Dh  # [Dh, block_k_size]
     v_offsets           = kv_offset[:, None] * Dh + dh_offset[None, :]       # [block_v_size, Dh]
 
     #load q, padding mask
@@ -314,7 +315,7 @@ def back_prop_attention_compute(do, q, k, v, O, LSE, sm_scale):
     return dQ, dK, dV
 
 #basic sanity test for FW pass
-def test_flash_attention_kernel(B=2, H=4, S=128, Dh=64, device=None, atol=5e-2, rtol=1e-2):
+def test_flash_attention_forward(B=2, H=4, S=128, Dh=64, device=None, atol=5e-2, rtol=1e-2):
     if device is None:
         device = torch.device("cuda")
     if not torch.cuda.is_available():
@@ -329,6 +330,8 @@ def test_flash_attention_kernel(B=2, H=4, S=128, Dh=64, device=None, atol=5e-2, 
     sm_scale = 1.0 / math.sqrt(Dh)
     triton_out, _ = forward_attention_compute(q, k, v, sm_scale)
     pytorch_out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm_scale)
+    #scaled dot_product_attention uses different backends (causes diff performance???)
+    #weird compiler
 
     torch.testing.assert_close(triton_out, pytorch_out, atol=atol, rtol=rtol)
     print(f"passed fwd: B={B}, H={H}, S={S}, Dh={Dh}, dtype={q.dtype}")
@@ -384,34 +387,62 @@ def _normalize_dtype(dtype):
     print("WARNING: Invalid type provided, defaulting to f32")
     return torch.float32
 
-@triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["S"],
-        x_vals=[128, 256, 512, 1024, 2048],
-        line_arg="provider",
-        line_vals=["triton", "sdpa"],
-        line_names=["TritonKernel", "TorchSDPA"],
-        ylabel="Latency (ms)",
-        plot_name="flash_attention_forward_benchmark",
-        args={},
+configs = []
+for mode in ["forward","backward"]:
+    configs.append(
+        triton.testing.Benchmark(
+            x_names=["Sequence Length"],
+            x_vals=[128, 256, 512, 1024, 2048, 4096, 8192, 16384],
+            line_arg="provider",
+            line_vals=["triton", "sdpa"],
+            line_names=["TritonKernel", "TorchSDPA"],
+            ylabel="Latency (ms)",
+            plot_name="flash_attention_{mode}_benchmark",
+            args={"mode": mode},
+        )
     )
-)
-def benchmark_flash_attention_kernel(S, provider, B=2, H=8, Dh=64, dtype=tl.float32):
+@triton.testing.perf_report(configs)
+def benchmark_flash_attention_kernel(mode, S, provider, B=2, H=8, Dh=64, dtype=tl.float32):
     #bug with testing fp16 or other mismatching floating points, changing above to f32 produces bug
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for benchmarking.")
     device = torch.device("cuda")
     torch.manual_seed(0)
+    assert mode in ["forward","backward"]
     dtype=_normalize_dtype(dtype)
     q = torch.randn((B, H, S, Dh), dtype=dtype, device=device)
     k = torch.randn((B, H, S, Dh), dtype=dtype, device=device)
     v = torch.randn((B, H, S, Dh), dtype=dtype, device=device)
     sm_scale = 1.0 / math.sqrt(Dh)
 
-    if provider == "triton":
-        fn = lambda: forward_attention_compute(q, k, v, sm_scale)[0]
+    #forward mode
+    if mode == "forward":
+        if provider == "triton":
+            fn = lambda: forward_attention_compute(q, k, v, sm_scale)[0]
+        else:
+            fn = lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm_scale)
+    #backward mode
     else:
-        fn = lambda: F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=sm_scale)
+        O, LSE = forward_attention_compute(q, k, v, sm_scale)
+        gO = torch.rand_like(q)
+
+        #tensors are not tracked in Torch by default, cloning does this
+        #other option is define tensor with requires_grad=True, but it messes up forward
+        q_pt = q.clone().requires_grad_(True)
+        k_pt = k.clone().requires_grad_(True)
+        v_pt = v.clone().requires_grad_(True)
+
+        if provider == "triton":
+            fn = lambda: back_prop_attention_compute(gO, q, k, v, O, LSE, sm_scale)
+        else:
+            def backward_pass_fn():
+                out = F.scaled_dot_product_attention(q_pt, k_pt, v_pt, is_causal=True, scale=sm_scale)
+                out.backward(gO)
+                #avoid accumulating zero values to exclude overhead of zeroing kernel
+                q_pt.grad = None
+                k_pt.grad = None
+                v_pt.grad = None
+            fn = backward_pass_fn
 
     ms = triton.testing.do_bench(fn, warmup=25, rep=100)
     return ms
@@ -419,8 +450,8 @@ def benchmark_flash_attention_kernel(S, provider, B=2, H=8, Dh=64, dtype=tl.floa
 if __name__ == "__main__":
     #NOTE: this implementation is based on Flash Attention Original and Version 2
     #Sanity test for flash_attention_kernel forward pass
-    test_flash_attention_kernel()
+    test_flash_attention_forward()
     #Sanity test for flash_attention_kernel backwards pass
     test_flash_attention_backward()
-    
+    #bench mark both
     benchmark_flash_attention_kernel.run(show_plots=True, print_data=True, save_path="../output/plots")
