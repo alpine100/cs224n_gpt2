@@ -52,3 +52,8 @@ References: https://web.stanford.edu/class/cs224n/project/DFP_Instructions.pdf
 
 Parts of the code are from the [`transformers`](https://github.com/huggingface/transformers)
 library ([Apache License 2.0](./LICENSE)).
+
+## Default Project:
+To generate flash attention benchmarks (default seq length up to 100k+ tokens), 
+cd into modules and run flash_attention.py
+Must be in a unix environment with GPU support enabled for triton to work. 
