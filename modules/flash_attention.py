@@ -3,6 +3,8 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+
+from benchmark_metrics import Benchmark
 #from triton.tools.tensor_descriptor import TensorDescriptor
 
 #DEVICE = triton.runtime.driver.active.get_active_torch_function()
@@ -330,6 +332,7 @@ def back_prop_attention_compute(do, q, k, v, O, LSE, sm_scale):
     shared memory:   132096 bytes
     '''
 
+    #memory (shared memory:   132096 bytes)
     #default num_stagers is 2 or 3, reduce to 1 if need memory
     #num_stages and warps are compiler opt. flags
     backpropt_attention_propagate[grid](
@@ -418,12 +421,23 @@ def _normalize_dtype(dtype):
     print("WARNING: Invalid type provided, defaulting to f32")
     return torch.float32
 
+'''
+NOTE: for values greater than 130172
+torch.OutOfMemoryError: CUDA out of memory. 
+Tried to allocate 2.00 GiB. GPU 0 has a total capacity of 21.95 GiB of which 730.12 MiB is free. 
+Including non-PyTorch memory, this process has 21.23 GiB memory in use. 
+Of the allocated memory 20.98 GiB is allocated by PyTorch, and 45.09 MiB is reserved by PyTorch but unallocated. 
+If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to 
+avoid fragmentation.  See documentation for Memory Management  
+(https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+'''
 configs = []
 for mode in ["Forward Pass","Back Prop"]:
     configs.append(
         triton.testing.Benchmark(
             x_names=["Sequence_Length"],
-            x_vals=[128, 256, 512, 1024, 2048, 4096, 8192, 16384],
+            x_vals=[128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32678, 65356, 130712],
+            x_log=True,
             line_arg="provider",
             line_vals=["triton", "sdpa"],
             line_names=["TritonKernel", "TorchSDPA"],
@@ -476,6 +490,8 @@ def benchmark_flash_attention_kernel(mode, Sequence_Length, provider, B=2, H=8, 
             fn = backward_pass_fn
 
     ms = triton.testing.do_bench(fn, warmup=25, rep=100)
+    torch_dtype = _normalize_dtype(dtype)
+    Benchmark.report_metrics(provider, mode, B, H, Sequence_Length, Dh, torch_dtype, ms)
     return ms
 
 if __name__ == "__main__":
@@ -486,3 +502,5 @@ if __name__ == "__main__":
     test_flash_attention_backward()
     #bench mark both
     benchmark_flash_attention_kernel.run(show_plots=True, print_data=True, save_path="../output/plots")
+    Benchmark.plot_benchmark_results()
+    
