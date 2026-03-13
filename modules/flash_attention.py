@@ -3,7 +3,6 @@ import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-import pytest
 #from triton.tools.tensor_descriptor import TensorDescriptor
 
 #DEVICE = triton.runtime.driver.active.get_active_torch_function()
@@ -175,7 +174,6 @@ def backpropt_attention_propagate(
     k_mask = kv_offset < S
     K_T = tl.load(k_ptr + k_t_offsets, mask=k_mask[None, :], other=0.0)
     V_T = tl.load(v_ptr + v_t_offsets, mask=k_mask[None, :], other=0.0)
-    K_blk = tl.load(k_ptr + k_offsets, mask=k_mask[:, None], other=0.0)
 
     # initialize dK_j = 0, dV_j = 0 on SRAM
     dk = tl.zeros([BLOCK_KV, Dh], dtype=tl.float32)
@@ -235,12 +233,17 @@ def backpropt_attention_propagate(
         # write dQ_i <- dQ_i + tau * dS_ij * K_j to HBM
         # since multiple KV loop blocks write to the same Q indices, 
         # we must use tl.atomic_add to safely accumulate in HBM.
-        dq = tl.dot(ds_ij.to(q.dtype), K_blk) * sm_scale
+        dq = tl.dot(ds_ij.to(q.dtype), tl.trans(K_T)) * sm_scale
         tl.atomic_add(dq_ptr + q_offsets, dq, mask=q_mask[:, None])
 
     # write dK_j <- dK_j, dV_j <- dV_j to HBM
-    tl.store(dk_ptr + k_offsets, dk.to(K_blk.dtype), mask=k_mask[:, None])
-    tl.store(dv_ptr + v_offsets, dv.to(K_blk.dtype), mask=k_mask[:, None])
+    tl.store(dk_ptr + k_offsets, dk.to(K_T.dtype), mask=k_mask[:, None])
+    tl.store(dv_ptr + v_offsets, dv.to(K_T.dtype), mask=k_mask[:, None])
+
+    #FYI (for backprop sanity check)
+    #64 x 64 = 4096 elements for 4 of the following: K_T block, V_T, K_blk, Q_T
+    #fp 32: 4 bytes
+    #~33 tiles × 4096 × 4 bytes ≈ 132KB
 
 #compute 
 def forward_attention_compute(q, k, v, sm_scale, dtype=torch.float32):
@@ -282,10 +285,20 @@ def forward_attention_compute(q, k, v, sm_scale, dtype=torch.float32):
     return O, LSE
 
 def back_prop_attention_compute(do, q, k, v, O, LSE, sm_scale):
-    do = do.contiguous()
+
+    #FYI: using default fp32 for BP results in resources error, even when reducing num_stages buffer from 3 --> 1
+    #triton.runtime.errors.OutOfResources: out of resource: shared memory (bytes), 
+    #Required: 114688, Hardware limit: 101376. Reducing block sizes or `num_stages` may help.
+    '''do = do.contiguous()
     q = q.contiguous()
     k = k.contiguous()
-    v = v.contiguous()
+    v = v.contiguous()'''
+    f16 = torch.float16
+    q_k = q.to(f16).contiguous()
+    k_k = k.to(f16).contiguous()
+    v_k = v.to(f16).contiguous()
+    O_k = O.to(f16).contiguous()
+    do_k = do.to(f16).contiguous()
 
     B, H, S, Dh = q.shape
 
@@ -303,13 +316,31 @@ def back_prop_attention_compute(do, q, k, v, O, LSE, sm_scale):
 
     grid = (triton.cdiv(S, BLOCK_KV), B * H)
     
+    compiled = backpropt_attention_propagate.warmup(
+        q, k, v, O, do, dQ, dK, dV, LSE, Delta,
+        sm_scale, B, H, S, Dh,
+        BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV,
+        grid=(triton.cdiv(S, BLOCK_KV), B * H),
+    )
+    #print(f"num_stages used: {compiled.metadata.num_stages}")
+    #print(f"shared memory:   {compiled.metadata.shared} bytes")
+    '''
+    memory debug analysis
+    num_stages used: 3
+    shared memory:   132096 bytes
+    '''
+
+    #default num_stagers is 2 or 3, reduce to 1 if need memory
+    #num_stages and warps are compiler opt. flags
     backpropt_attention_propagate[grid](
-        q, k, v, O, do,
+        q_k, k_k, v_k, O_k, do_k,
         dQ, dK, dV,
         LSE, Delta,
         sm_scale,
         B, H, S, Dh,
-        BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV
+        BLOCK_Q=BLOCK_Q, BLOCK_KV=BLOCK_KV,
+        num_stages=1,
+        num_warps=4,
     )
     
     return dQ, dK, dV
@@ -388,35 +419,35 @@ def _normalize_dtype(dtype):
     return torch.float32
 
 configs = []
-for mode in ["forward","backward"]:
+for mode in ["Forward Pass","Back Prop"]:
     configs.append(
         triton.testing.Benchmark(
-            x_names=["Sequence Length"],
+            x_names=["Sequence_Length"],
             x_vals=[128, 256, 512, 1024, 2048, 4096, 8192, 16384],
             line_arg="provider",
             line_vals=["triton", "sdpa"],
             line_names=["TritonKernel", "TorchSDPA"],
             ylabel="Latency (ms)",
-            plot_name="flash_attention_{mode}_benchmark",
+            plot_name=f"{mode} Latency Benchmark",
             args={"mode": mode},
         )
     )
 @triton.testing.perf_report(configs)
-def benchmark_flash_attention_kernel(mode, S, provider, B=2, H=8, Dh=64, dtype=tl.float32):
+def benchmark_flash_attention_kernel(mode, Sequence_Length, provider, B=2, H=8, Dh=64, dtype=tl.float32):
     #bug with testing fp16 or other mismatching floating points, changing above to f32 produces bug
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for benchmarking.")
     device = torch.device("cuda")
     torch.manual_seed(0)
-    assert mode in ["forward","backward"]
+    assert mode in ["Forward Pass","Back Prop"]
     dtype=_normalize_dtype(dtype)
-    q = torch.randn((B, H, S, Dh), dtype=dtype, device=device)
-    k = torch.randn((B, H, S, Dh), dtype=dtype, device=device)
-    v = torch.randn((B, H, S, Dh), dtype=dtype, device=device)
+    q = torch.randn((B, H, Sequence_Length, Dh), dtype=dtype, device=device)
+    k = torch.randn((B, H, Sequence_Length, Dh), dtype=dtype, device=device)
+    v = torch.randn((B, H, Sequence_Length, Dh), dtype=dtype, device=device)
     sm_scale = 1.0 / math.sqrt(Dh)
 
     #forward mode
-    if mode == "forward":
+    if mode == "Forward Pass":
         if provider == "triton":
             fn = lambda: forward_attention_compute(q, k, v, sm_scale)[0]
         else:
