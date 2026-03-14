@@ -16,7 +16,10 @@ import random
 import torch
 
 import numpy as np
+import pandas as pd
 import torch.nn.functional as F
+
+import matplotlib.pyplot as plt
 
 from torch import nn
 from torch.utils.data import DataLoader
@@ -50,7 +53,14 @@ class ParaphraseGPT(nn.Module):
 
   def __init__(self, args):
     super().__init__()
-    self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
+    self.gpt = GPT2Model.from_pretrained(
+      model=args.model_size,
+      d=args.d,
+      l=args.l,
+      num_heads=args.num_heads,
+      use_flash_attn_kernel=args.use_flash_attn_kernel,
+      use_longformer=args.use_longformer
+    )
     self.paraphrase_detection_head = nn.Linear(args.d, 2)  # Paraphrase detection has two outputs: 1 (yes) or 0 (no).
 
     # By default, fine-tune the full model.
@@ -71,7 +81,12 @@ class ParaphraseGPT(nn.Module):
     """
 
     'Takes a batch of sentences and produces embeddings for them.'
-    gpt_out = self.gpt(input_ids=input_ids, attention_mask=attention_mask)
+    gpt_out = self.gpt(
+      input_ids=input_ids, 
+      attention_mask=attention_mask, 
+      use_flash_attn_kernel=use_flash_attn_kernel,
+      use_longformer=use_longformer
+    )
     last_hidden = gpt_out["last_token"]
     logits = self.gpt.hidden_state_to_token(last_hidden)
     return logits
@@ -186,6 +201,112 @@ def test(args):
     for p, s in zip(test_para_sent_ids, test_para_y_pred):
       f.write(f"{p}, {s} \n")
 
+@torch.no_grad()
+def benchmark_run(args, label):
+    device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+    saved = torch.load(args.filepath, weights_only=False)
+
+    # BUG FIX: merge current flags into saved args so attention mode is respected
+    saved['args'].use_flash_attn_kernel = args.use_flash_attn_kernel
+    saved['args'].use_longformer = args.use_longformer
+
+    model = ParaphraseGPT(saved['args'])
+    model.load_state_dict(saved['model'])
+    model = model.to(device)
+    model.eval()
+
+    para_dev_data = load_paraphrase_data(args.para_dev)
+    para_dev_data = ParaphraseDetectionDataset(para_dev_data, args)
+    para_dev_dataloader = DataLoader(
+        para_dev_data, shuffle=False, batch_size=args.batch_size,
+        collate_fn=para_dev_data.collate_fn
+    )
+
+    # Warmup
+    for batch in para_dev_dataloader:
+        b_ids = batch['token_ids'].to(device)
+        b_mask = batch['attention_mask'].to(device)
+        _ = model(b_ids, b_mask)
+        break
+    torch.cuda.synchronize()
+
+    results = []
+    for batch in tqdm(para_dev_dataloader, desc=f'benchmarking [{label}]'):
+        b_ids = batch['token_ids'].to(device)
+        b_mask = batch['attention_mask'].to(device)
+        seq_len = b_ids.shape[1]
+        batch_size = b_ids.shape[0]
+
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        _ = model(b_ids, b_mask)
+        end.record()
+        torch.cuda.synchronize()
+
+        latency_ms = start.elapsed_time(end)
+        tokens_per_sec = (batch_size * seq_len) / (latency_ms / 1000)
+        d, l = saved['args'].d, saved['args'].l
+        flops = 4 * (seq_len ** 2) * d * l * batch_size
+        tflops = (flops / (latency_ms / 1000)) / 1e12
+
+        results.append({
+            "seq_len": seq_len,
+            "latency_ms": latency_ms,
+            "tokens_per_sec": tokens_per_sec,
+            "tflops": tflops,
+            "label": label,
+        })
+
+    return results
+
+
+@torch.no_grad()
+def benchmark(args):
+    args.use_flash_attn_kernel = True
+    args.use_longformer = False
+    flash_results = benchmark_run(args, label='flash')
+
+    args.use_flash_attn_kernel = False
+    args.use_longformer = False
+    normal_results = benchmark_run(args, label='normal')
+
+    args.use_flash_attn_kernel = False
+    args.use_longformer = True
+    longformer_results = benchmark_run(args, label='longformer')
+
+    plot_benchmark(flash_results, normal_results, longformer_results)
+
+
+def plot_benchmark(flash_results, normal_results, longformer_results):
+    all_runs = [
+        (flash_results,      'flash',      'steelblue',  'o'),
+        (normal_results,     'normal',     'darkorange', 's'),
+        (longformer_results, 'longformer', 'seagreen',   '^'),
+    ]
+
+    metrics = [
+        ("latency_ms",     "Latency (ms)",    "Latency vs Sequence Length"),
+        ("tflops",         "TFLOP/s",         "Compute Throughput vs Sequence Length"),
+        ("tokens_per_sec", "Tokens / Second", "Tokens per Second vs Sequence Length"),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig.suptitle("Paraphrase Detection Benchmark — Flash vs Normal vs Longformer", fontsize=14, fontweight='bold')
+
+    for ax, (key, ylabel, title) in zip(axes, metrics):
+        for results, label, color, marker in all_runs:
+            df = pd.DataFrame(results)
+            grouped = df.groupby("seq_len")[key].mean().reset_index()  # BUG FIX: average across same-length batches
+            ax.plot(grouped["seq_len"], grouped[key], color=color, marker=marker, label=label)  # BUG FIX: plot not scatter
+        ax.set_title(title)
+        ax.set_xlabel("Sequence Length (padded)")
+        ax.set_ylabel(ylabel)
+        ax.legend()
+
+    plt.tight_layout()
+    plt.savefig("Paraphrase_Benchmark_Results.png", dpi=150)
+    plt.show()
 
 def get_args():
   parser = argparse.ArgumentParser()
@@ -199,6 +320,13 @@ def get_args():
   parser.add_argument("--seed", type=int, default=11711)
   parser.add_argument("--epochs", type=int, default=10)
   parser.add_argument("--use_gpu", action='store_true')
+  
+  #bench mark runs paraphrase with default, longformer, flash_attn_kernel
+  parser.add_argument("--benchmark",action='store_true')
+
+  #run model with these to toggle longformer and flash_attn_kernel
+  parser.add_argument("--use_flash_attn_kernel",action='store_true')
+  parser.add_argument("--use_longformer",action='store_true')
 
   parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
   parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)

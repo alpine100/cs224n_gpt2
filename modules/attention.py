@@ -31,7 +31,7 @@ class CausalSelfAttention(nn.Module):
     proj = rearrange(proj, 'b t h d -> b h t d')
     return proj
 
-  def attention(self, key, query, value, attention_mask):
+  def attention(self, key, query, value, attention_mask, use_flash_attn_kernel=False, use_longformer=False):
 
     ### YOUR CODE HERE
     #check if nn.Module training attr is set before applying dropout
@@ -41,21 +41,26 @@ class CausalSelfAttention(nn.Module):
     # Create causal mask on the same device and with the same dtype as attention_mask
     causal_mask = torch.triu(torch.full((S, S), -10000.0, device=attention_mask.device, dtype=attention_mask.dtype), diagonal=1)
     
-    # longformer mask 
-    window_size = 512 # cite
-    window_mask = torch.triu(torch.full((S, S), -10000.0, device=attention_mask.device, dtype=attention_mask.dtype), diagonal=-window_size)
-    
-    # combine masks together
-    longformer_mask = causal_mask + window_mask
+    if use_longformer:
+      # longformer mask 
+      window_size = 512 # cite
+      window_mask = torch.triu(torch.full((S, S), -10000.0, device=attention_mask.device, dtype=attention_mask.dtype), diagonal=-window_size)
+      
+      # combine masks together
+      longformer_mask = causal_mask + window_mask
 
-    # longformer global attention
-    resulting_mask = longformer_mask + attention_mask
+      # longformer global attention
+      resulting_mask = longformer_mask + attention_mask
+    else:
+      attention_mask = causal mask (s,s) + padding(bs,h,query_positions,key_positions(s))
+      # add padding to respective cols in mask
+      resulting_mask = causal_mask + attention_mask
 
-    # attention_mask = causal mask (s,s) + padding(bs,h,query_positions,key_positions(s))
-    #                  add padding to respective cols in mask
-    # resulting_mask = causal_mask + attention_mask
-
-    attention_output = nn.functional.scaled_dot_product_attention(query, key, value, attn_mask=resulting_mask, dropout_p=dropout_p)
+    if use_flash_attn_kernel:
+      #USE THE TRITON IMPLEMENTATION
+      #TODO
+    else:
+      attention_output = nn.functional.scaled_dot_product_attention(query, key, value, attn_mask=resulting_mask, dropout_p=dropout_p)
     
     # convert from (bs, num_heads, seq_len, head_dim) to (bs, seq_len, hidden_size)
     result = rearrange(attention_output, 'b h t d -> b t (h d)')
@@ -63,7 +68,7 @@ class CausalSelfAttention(nn.Module):
     return result
 
 
-  def forward(self, hidden_states, attention_mask):
+  def forward(self, hidden_states, attention_mask, use_flash_attn_kernel=False, use_longformer=False):
     """
     hidden_states: [bs, seq_len, hidden_state]
     attention_mask: [bs, 1, 1, seq_len]
@@ -77,5 +82,5 @@ class CausalSelfAttention(nn.Module):
     query_layer = self.transform(hidden_states, self.query)
     
     # Calculate the multi-head attention.
-    attn_value = self.attention(key_layer, query_layer, value_layer, attention_mask)
+    attn_value = self.attention(key_layer, query_layer, value_layer, attention_mask, use_flash_attn_kernel, use_longformer)
     return attn_value
