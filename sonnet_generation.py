@@ -12,7 +12,10 @@ import random
 import torch
 
 import numpy as np
+import pandas as pd
 import torch.nn.functional as F
+
+import matplotlib.pyplot as plt
 
 from torch import nn
 from torch.utils.data import DataLoader
@@ -46,7 +49,13 @@ class SonnetGPT(nn.Module):
 
   def __init__(self, args):
     super().__init__()
-    self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
+    self.use_flash_attn_kernel = getattr(args, "use_flash_attn_kernel", False)
+    self.use_longformer = getattr(args, "use_longformer", False)
+    self.gpt = GPT2Model.from_pretrained(
+      model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads,
+      use_flash_attn_kernel=self.use_flash_attn_kernel,
+      use_longformer=self.use_longformer
+    )
     self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -60,8 +69,14 @@ class SonnetGPT(nn.Module):
     not just the last token! This will allow our model to learn the natural language distribution that composes sonnets,
     not just the distribution over next tokens for the last token!
     """
-    ### YOUR CODE HERE
-    raise NotImplementedError
+    gpt_out = self.gpt(
+      input_ids=input_ids,
+      attention_mask=attention_mask,
+      use_flash_attn_kernel=self.use_flash_attn_kernel,
+      use_longformer=self.use_longformer
+    )
+    logits = self.gpt.hidden_state_to_token(gpt_out["last_hidden_state"])
+    return logits
 
 
   def get_device(self):
@@ -215,6 +230,122 @@ def generate_submission_sonnets(args):
       f.write(f"\n{sonnet[0]}\n")
       f.write(sonnet[1])
 
+@torch.no_grad()
+def benchmark_run(args, label):
+  device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+  if device.type != "cuda":
+    raise RuntimeError("benchmark_run requires --use_gpu")
+  saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+
+  saved['args'].use_flash_attn_kernel = args.use_flash_attn_kernel
+  saved['args'].use_longformer = args.use_longformer
+
+  model = SonnetGPT(saved['args'])
+  model.load_state_dict(saved['model'])
+  model = model.to(device)
+  model.eval()
+  dtype = next(model.parameters()).dtype
+  ebytes = torch.finfo(dtype).bits // 8
+
+  sonnet_data = SonnetsDataset(args.sonnet_path)
+  sonnet_dataloader = DataLoader(
+    sonnet_data, shuffle=False, batch_size=args.batch_size,
+    collate_fn=sonnet_data.collate_fn
+  )
+
+  # Warmup
+  for batch in sonnet_dataloader:
+    b_ids = batch['token_ids'].to(device)
+    b_mask = batch['attention_mask'].to(device)
+    _ = model(b_ids, b_mask)
+    break
+  torch.cuda.synchronize()
+
+  results = []
+  for batch in tqdm(sonnet_dataloader, desc=f'benchmarking [{label}]'):
+    b_ids = batch['token_ids'].to(device)
+    b_mask = batch['attention_mask'].to(device)
+    seq_len = b_ids.shape[1]
+    batch_size = b_ids.shape[0]
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    _ = model(b_ids, b_mask)
+    end.record()
+    torch.cuda.synchronize()
+
+    latency_ms = start.elapsed_time(end)
+    tokens_per_sec = (batch_size * seq_len) / (latency_ms / 1000)
+    d, l = saved['args'].d, saved['args'].l
+    flops = 4 * (seq_len ** 2) * d * l * batch_size
+    tflops = (flops / (latency_ms / 1000)) / 1e12
+    mem_bytes = 3 * batch_size * saved['args'].num_heads * seq_len * (d // saved['args'].num_heads) * ebytes
+    mem_bytes += batch_size * saved['args'].num_heads * seq_len * (d // saved['args'].num_heads) * ebytes
+    mem_bytes += batch_size * saved['args'].num_heads * seq_len * 4
+    membw_tbs = (mem_bytes / (latency_ms / 1000)) / 1e12
+
+    results.append({
+      "seq_len": seq_len,
+      "latency_ms": latency_ms,
+      "tokens_per_sec": tokens_per_sec,
+      "tflops": tflops,
+      "membw_tbs": membw_tbs,
+      "label": label,
+    })
+
+  return results
+
+
+@torch.no_grad()
+def benchmark(args):
+  args.use_flash_attn_kernel = True
+  args.use_longformer = False
+  flash_results = benchmark_run(args, label='flash')
+
+  args.use_flash_attn_kernel = False
+  args.use_longformer = False
+  normal_results = benchmark_run(args, label='normal')
+
+  args.use_flash_attn_kernel = False
+  args.use_longformer = True
+  longformer_results = benchmark_run(args, label='longformer')
+
+  plot_benchmark(flash_results, normal_results, longformer_results)
+
+
+def plot_benchmark(flash_results, normal_results, longformer_results):
+  all_runs = [
+    (flash_results,      'flash',      'steelblue',  'o'),
+    (normal_results,     'normal',     'darkorange', 's'),
+    (longformer_results, 'longformer', 'seagreen',   '^'),
+  ]
+
+  metrics = [
+    ("latency_ms",     "Latency (ms)",            "Latency vs Sequence Length"),
+    ("tflops",         "TFLOP/s",                 "Compute Throughput vs Sequence Length"),
+    ("membw_tbs",      "Memory Bandwidth (TB/s)", "Memory Bandwidth vs Sequence Length"),
+    ("tokens_per_sec", "Tokens / Second",         "Tokens per Second vs Sequence Length"),
+  ]
+
+  fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+  fig.suptitle("Sonnet Generation Benchmark — Flash vs Normal vs Longformer", fontsize=14, fontweight='bold')
+  axes = axes.flatten()
+
+  for ax, (key, ylabel, title) in zip(axes, metrics):
+    for results, label, color, marker in all_runs:
+      df = pd.DataFrame(results)
+      grouped = df.groupby("seq_len")[key].mean().reset_index()
+      ax.plot(grouped["seq_len"], grouped[key], color=color, marker=marker, label=label)
+    ax.set_title(title)
+    ax.set_xlabel("Sequence Length (padded)")
+    ax.set_ylabel(ylabel)
+    ax.legend()
+
+  plt.tight_layout()
+  plt.savefig("Sonnet_Benchmark_Results.png", dpi=150)
+  plt.show()
+
 
 def get_args():
   parser = argparse.ArgumentParser()
@@ -226,6 +357,10 @@ def get_args():
   parser.add_argument("--seed", type=int, default=11711)
   parser.add_argument("--epochs", type=int, default=10)
   parser.add_argument("--use_gpu", action='store_true')
+  parser.add_argument("--benchmark", action='store_true')
+
+  parser.add_argument("--use_flash_attn_kernel", action='store_true')
+  parser.add_argument("--use_longformer", action='store_true')
 
   # Generation parameters.
   parser.add_argument("--temperature", type=float, help="softmax temperature.", default=1.2)
@@ -264,5 +399,8 @@ if __name__ == "__main__":
   args = get_args()
   args.filepath = f'{args.epochs}-{args.lr}-sonnet.pt'  # Save path.
   seed_everything(args.seed)  # Fix the seed for reproducibility.
-  train(args)
-  generate_submission_sonnets(args)
+  if args.benchmark:
+    benchmark(args)
+  else:
+    train(args)
+    generate_submission_sonnets(args)
