@@ -1,7 +1,17 @@
+import math
 import torch
 
 from einops import rearrange
 from torch import nn
+
+try:
+  #incase Triton is being weird
+  from modules.flash_attention import forward_attention_compute
+  _FLASH_AVAILABLE = True
+except Exception as e:
+  print("NOTE: Defaulting to in built flash attention")
+  forward_attention_compute = None
+  _FLASH_AVAILABLE = False
 
 
 class CausalSelfAttention(nn.Module):
@@ -31,31 +41,43 @@ class CausalSelfAttention(nn.Module):
     proj = rearrange(proj, 'b t h d -> b h t d')
     return proj
 
-  def attention(self, key, query, value, attention_mask):
+  def attention(self, key, query, value, attention_mask, use_flash_attn_kernel=False, use_longformer=False):
 
     ### YOUR CODE HERE
-    #check if nn.Module training attr is set before applying dropout
+    # check if nn.Module training attr is set before applying dropout
     dropout_p = self.dropout.p if self.training else 0
     #key positions (s)
     S = key.size(-2)
-    # Create causal mask on the same device and with the same dtype as attention_mask
-    causal_mask = torch.triu(torch.full((S, S), -10000.0, device=attention_mask.device, dtype=attention_mask.dtype), diagonal=1)
-    
-    # longformer mask 
-    window_size = 512 # cite
-    window_mask = torch.triu(torch.full((S, S), -10000.0, device=attention_mask.device, dtype=attention_mask.dtype), diagonal=-window_size)
-    
-    # combine masks together
-    longformer_mask = causal_mask + window_mask
 
-    # longformer global attention
-    resulting_mask = longformer_mask + attention_mask
+    # Use flash attention only for inference with no padding and not longformer.
+    no_padding = attention_mask is None or torch.all(attention_mask == 0)
+    #WARNING and NOTE: Some weird quirk about training, padding needed????
+    #if (use_flash_attn_kernel and (not use_longformer)
+    #    and (not self.training) and _FLASH_AVAILABLE and no_padding and query.is_cuda):
+    if _FLASH_AVAILABLE and use_flash_attn_kernel:
+      sm_scale = 1.0 / math.sqrt(self.attention_head_size)
+      attention_output, _ = forward_attention_compute(query, key, value, sm_scale)
+    else:
+      # Create causal mask on the same device and with the same dtype as attention_mask
+      causal_mask = torch.triu(
+        torch.full((S, S), -10000.0, device=attention_mask.device, dtype=attention_mask.dtype),
+        diagonal=1
+      )
 
-    # attention_mask = causal mask (s,s) + padding(bs,h,query_positions,key_positions(s))
-    #                  add padding to respective cols in mask
-    # resulting_mask = causal_mask + attention_mask
+      # longformer mask
+      if use_longformer:
+        window_size = 512
+        window_mask = torch.triu(
+          torch.full((S, S), -10000.0, device=attention_mask.device, dtype=attention_mask.dtype),
+          diagonal=-window_size
+        )
+        causal_mask = causal_mask + window_mask
 
-    attention_output = nn.functional.scaled_dot_product_attention(query, key, value, attn_mask=resulting_mask, dropout_p=dropout_p)
+      # attention_mask = causal mask (S,S) + padding(bs,1,1,S)
+      resulting_mask = causal_mask + attention_mask
+      attention_output = nn.functional.scaled_dot_product_attention(
+        query, key, value, attn_mask=resulting_mask, dropout_p=dropout_p
+      )
     
     # convert from (bs, num_heads, seq_len, head_dim) to (bs, seq_len, hidden_size)
     result = rearrange(attention_output, 'b h t d -> b t (h d)')
@@ -63,7 +85,7 @@ class CausalSelfAttention(nn.Module):
     return result
 
 
-  def forward(self, hidden_states, attention_mask):
+  def forward(self, hidden_states, attention_mask, use_flash_attn_kernel=False, use_longformer=False):
     """
     hidden_states: [bs, seq_len, hidden_state]
     attention_mask: [bs, 1, 1, seq_len]
@@ -77,5 +99,5 @@ class CausalSelfAttention(nn.Module):
     query_layer = self.transform(hidden_states, self.query)
     
     # Calculate the multi-head attention.
-    attn_value = self.attention(key_layer, query_layer, value_layer, attention_mask)
+    attn_value = self.attention(key_layer, query_layer, value_layer, attention_mask, use_flash_attn_kernel, use_longformer)
     return attn_value

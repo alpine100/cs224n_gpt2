@@ -40,7 +40,7 @@ class GPT2Layer(nn.Module):
     return input + dropped_output
 
 
-  def forward(self, hidden_states, attention_mask):
+  def forward(self, hidden_states, attention_mask, use_flash_attn_kernel=False, use_longformer=False):
     """
     TODO: Implement the forward pass. Some key points to consider:
            - A multi-head attention layer (CausalSelfAttention) that computes self-attention based on masked inputs.
@@ -54,7 +54,7 @@ class GPT2Layer(nn.Module):
     normed_attn_input = self.attention_layer_norm(hidden_states)
     
     # compute self-attention
-    attn_output = self.self_attention(normed_attn_input, attention_mask)
+    attn_output = self.self_attention(normed_attn_input, attention_mask, use_flash_attn_kernel, use_longformer)
     
     # apply dense, dropout, and residual connection using add
     attention_output = self.add(hidden_states, attn_output, self.attention_dense, self.attention_dropout)
