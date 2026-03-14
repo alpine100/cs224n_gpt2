@@ -5,9 +5,10 @@ from einops import rearrange
 from torch import nn
 
 try:
+  #incase Triton is being weird
   from modules.flash_attention import forward_attention_compute
   _FLASH_AVAILABLE = True
-except Exception:
+except Exception as e:
   print("NOTE: Defaulting to in built flash attention")
   forward_attention_compute = None
   _FLASH_AVAILABLE = False
@@ -50,8 +51,10 @@ class CausalSelfAttention(nn.Module):
 
     # Use flash attention only for inference with no padding and not longformer.
     no_padding = attention_mask is None or torch.all(attention_mask == 0)
-    if (use_flash_attn_kernel and (not use_longformer)
-        and (not self.training) and _FLASH_AVAILABLE and no_padding and query.is_cuda):
+    #WARNING and NOTE: Some weird quirk about training, padding needed????
+    #if (use_flash_attn_kernel and (not use_longformer)
+    #    and (not self.training) and _FLASH_AVAILABLE and no_padding and query.is_cuda):
+    if _FLASH_AVAILABLE and use_flash_attn_kernel:
       sm_scale = 1.0 / math.sqrt(self.attention_head_size)
       attention_output, _ = forward_attention_compute(query, key, value, sm_scale)
     else:

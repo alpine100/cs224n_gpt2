@@ -241,6 +241,8 @@ def benchmark_run(args, label):
         seq_len = b_ids.shape[1]
         batch_size = b_ids.shape[0]
 
+        torch.cuda.reset_peak_memory_stats(device)
+
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
@@ -249,6 +251,9 @@ def benchmark_run(args, label):
         torch.cuda.synchronize()
 
         latency_ms = start.elapsed_time(end)
+        peak_mem_bytes = torch.cuda.max_memory_allocated(device)  # ADD THIS
+        memory_bandwidth_tbs = (peak_mem_bytes / (latency_ms / 1000)) / 1e12  # bytes -> TB/s
+
         tokens_per_sec = (batch_size * seq_len) / (latency_ms / 1000)
         d, l = saved['args'].d, saved['args'].l
         flops = 4 * (seq_len ** 2) * d * l * batch_size
@@ -259,6 +264,7 @@ def benchmark_run(args, label):
             "latency_ms": latency_ms,
             "tokens_per_sec": tokens_per_sec,
             "tflops": tflops,
+            "memory_bandwidth_tbs": memory_bandwidth_tbs,
             "label": label,
         })
 
@@ -290,26 +296,28 @@ def plot_benchmark(flash_results, normal_results, longformer_results):
     ]
 
     metrics = [
-        ("latency_ms",     "Latency (ms)",    "Latency vs Sequence Length"),
-        ("tflops",         "TFLOP/s",         "Compute Throughput vs Sequence Length"),
-        ("tokens_per_sec", "Tokens / Second", "Tokens per Second vs Sequence Length"),
+        ("latency_ms",           "Latency (ms)",        "Latency vs Sequence Length"),
+        ("tflops",               "TFLOP/s",             "Compute Throughput vs Sequence Length"),
+        ("memory_bandwidth_tbs", "Memory BW (TB/s)",    "Memory Bandwidth vs Sequence Length"),  # NEW
+        ("tokens_per_sec",       "Tokens / Second",     "Tokens per Second vs Sequence Length"),
     ]
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))  # 2x2 grid
+    axes = axes.flatten()  # so we can still iterate with zip
     fig.suptitle("Paraphrase Detection Benchmark — Flash vs Normal vs Longformer", fontsize=14, fontweight='bold')
 
     for ax, (key, ylabel, title) in zip(axes, metrics):
         for results, label, color, marker in all_runs:
             df = pd.DataFrame(results)
-            grouped = df.groupby("seq_len")[key].mean().reset_index()  # BUG FIX: average across same-length batches
-            ax.plot(grouped["seq_len"], grouped[key], color=color, marker=marker, label=label)  # BUG FIX: plot not scatter
+            grouped = df.groupby("seq_len")[key].mean().reset_index()
+            ax.plot(grouped["seq_len"], grouped[key], color=color, marker=marker, label=label)
         ax.set_title(title)
         ax.set_xlabel("Sequence Length (padded)")
         ax.set_ylabel(ylabel)
         ax.legend()
 
     plt.tight_layout()
-    plt.savefig("Paraphrase_Benchmark_Results.png", dpi=150)
+    plt.savefig("./output/L4/Paraphrase_Benchmark_Results.png", dpi=150)
     plt.show()
 
 def get_args():

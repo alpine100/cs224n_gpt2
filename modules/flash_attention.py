@@ -4,7 +4,6 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from benchmark_metrics import Benchmark
 #from triton.tools.tensor_descriptor import TensorDescriptor
 
 #DEVICE = triton.runtime.driver.active.get_active_torch_function()
@@ -496,6 +495,9 @@ def benchmark_flash_attention_kernel(mode, Sequence_Length, provider, B=2, H=8, 
 
 if __name__ == "__main__":
     #NOTE: this implementation is based on Flash Attention Original and Version 2
+    #NOTE: this Benchmark is for standalone Flash Attention benchmarking
+    from benchmark_metrics import Benchmark
+
     #Sanity test for flash_attention_kernel forward pass
     test_flash_attention_forward()
     #Sanity test for flash_attention_kernel backwards pass
