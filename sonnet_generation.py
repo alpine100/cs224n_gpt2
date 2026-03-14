@@ -39,7 +39,7 @@ volume = modal.Volume.from_name("sonnet-results", create_if_missing=True)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch", "transformers", "einops", "tqdm", "numpy", "importlib-metadata", "requests")
+    .pip_install("torch", "transformers", "einops", "tqdm", "numpy", "importlib-metadata", "requests", "pronouncing")
     .add_local_dir(".", remote_path="/root", copy=False) 
 )
 
@@ -79,6 +79,17 @@ def seed_everything(seed=11711):
   torch.backends.cudnn.benchmark = False
   torch.backends.cudnn.deterministic = True
 
+def get_last_word(line):
+  words = line.strip().rstrip('.,;:!?').split()
+  return words[-1].lower() if words else ''
+
+def rhymes(word1, word2):
+  import pronouncing
+  phones1 = pronouncing.phones_for_word(word1)
+  phones2 = pronouncing.phones_for_word(word2)
+  if not phones1 or not phones2:
+    return False
+  return pronouncing.rhyming_part(phones1[0]) == pronouncing.rhyming_part(phones2[0])
 
 class SonnetGPT(nn.Module):
   """Your GPT-2 Model designed for paraphrase detection."""
@@ -125,7 +136,7 @@ class SonnetGPT(nn.Module):
       return param.device
 
   @torch.no_grad()
-  def generate(self, encoding, temperature=0.7, top_p=0.9, top_k=50, max_length=200):
+  def generate(self, encoding, temperature=0.7, top_p=0.9, top_k=50, max_length=400, repetition_penalty=1.1):
     """
     Generates an original sonnet using top-p sampling and softmax temperature.
 
@@ -135,12 +146,24 @@ class SonnetGPT(nn.Module):
     """
     token_ids = encoding.to(self.get_device())
     attention_mask = torch.ones(token_ids.shape, dtype=torch.int64).to(self.get_device())
-
+    newline_id = self.tokenizer.encode('\n')[0]
+    line_count = 0
+    completed_lines = []
+    line_start_len = token_ids.shape[1]
+    rhyme_retries = 0
+    # ABAB CDCD EFEF GG rhyme scheme
+    RHYME_PAIRS = {2:0, 3:1, 6:4, 7:5, 10:8, 11:9, 13:12}
+    MAX_RHYME_RETRIES = 5
 
     for _ in range(max_length):
       # Forward pass to get logits
       logits_sequence = self.forward(token_ids, attention_mask)
       logits_last_token = logits_sequence[:, -1, :] / temperature  # Apply temperature scaling
+
+      if repetition_penalty != 1.0:
+          recent_tokens = token_ids[0, -40:].tolist()  # only penalize last 40 tokens to avoid fragmentation
+          for token_id in set(recent_tokens):
+              logits_last_token[0, token_id] /= repetition_penalty
 
       # Convert logits to probabilities
       probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
@@ -171,6 +194,25 @@ class SonnetGPT(nn.Module):
       # Stop if end-of-sequence token is reached
       if sampled_token.item() == self.tokenizer.eos_token_id:
         break
+
+      # stop at 14 lines to enforce sonnet structure
+      if sampled_token.item() == newline_id:
+          current_line = self.tokenizer.decode(token_ids[0, line_start_len:].cpu().tolist())
+          # check rhyme scheme; retry line if it doesn't rhyme and we have retries left
+          if line_count in RHYME_PAIRS and rhyme_retries < MAX_RHYME_RETRIES:
+              target_line = completed_lines[RHYME_PAIRS[line_count]]
+              if not rhymes(get_last_word(current_line), get_last_word(target_line)):
+                  token_ids = token_ids[:, :line_start_len]
+                  attention_mask = attention_mask[:, :line_start_len]
+                  rhyme_retries += 1
+                  continue
+          # accept the line
+          completed_lines.append(current_line)
+          line_count += 1
+          line_start_len = token_ids.shape[1] + 1  # +1 for the newline about to be appended
+          rhyme_retries = 0
+          if line_count >= 14:
+              break
 
       # Append sampled token
       token_ids = torch.cat([token_ids, sampled_token], dim=1)
@@ -216,7 +258,7 @@ def train(args):
 
   # early stopping vars
   best_loss = float('inf')
-  patience = 3 # stop after 3 epochs of no improvement
+  patience = 5 # stop after 5 epochs of no improvement
   patience_counter = 0
 
   # Run for the specified number of epochs.
@@ -314,7 +356,7 @@ def generate_submission_sonnets(args):
   with open(args.sonnet_out, "w+") as f:
     f.write(f"--Generated Sonnets-- \n\n")
     for sonnet in generated_sonnets:
-      f.write(f"\n{sonnet[0]}\n")
+      f.write(f"{sonnet[0]}\n\n")
       f.write(sonnet[1])
 
 
@@ -330,7 +372,7 @@ def get_args():
   parser.add_argument("--use_gpu", action='store_true')
 
   # Generation parameters.
-  parser.add_argument("--temperature", type=float, help="softmax temperature.", default=1.2)
+  parser.add_argument("--temperature", type=float, help="softmax temperature.", default=0.9)
   parser.add_argument("--top_p", type=float, help="Cumulative probability distribution for nucleus sampling.",
                       default=0.9)
 
@@ -368,7 +410,7 @@ if __name__ == "__main__":
     
     if modal.is_local():
         print("Launching on Modal GPU...")
-        with app.run():
+        with app.run(detach=True):
             train_remote.remote(vars(args)) # trigger modal w remote
     else:
         # run this inside cloud container
