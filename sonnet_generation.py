@@ -12,10 +12,7 @@ import random
 import torch
 
 import numpy as np
-import pandas as pd
 import torch.nn.functional as F
-
-import matplotlib.pyplot as plt
 
 from torch import nn
 from torch.utils.data import DataLoader
@@ -32,6 +29,45 @@ from optimizer import AdamW
 
 TQDM_DISABLE = False
 
+import modal
+import os
+from argparse import Namespace
+
+# set up modal app
+app = modal.App("sonnet-generator")
+volume = modal.Volume.from_name("sonnet-results", create_if_missing=True)
+
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("torch", "transformers", "einops", "tqdm", "numpy", "importlib-metadata", "requests")
+    .add_local_dir(".", remote_path="/root", copy=False) 
+)
+
+@app.function(
+    gpu="H100",
+    image=image,
+    volumes={"/root/results": volume},
+    timeout=3600
+)
+
+def train_remote(args_dict):
+    args = Namespace(**args_dict)
+    os.chdir("/root")
+
+    # set params
+    args.use_gpu = True
+    args.batch_size = 32
+    args.lr = 5e-5
+    args.sonnet_out = "/root/results/generated_sonnets_dev.txt"
+    args.filepath = f"/root/results/{args.epochs}-{args.lr}-sonnet.pt"
+    
+    # now run standard logic
+    seed_everything(args.seed)
+    train(args)
+    generate_submission_sonnets(args)
+    
+    volume.commit() 
+    print("Training complete and files saved to Volume.")
 
 # Fix the random seed.
 def seed_everything(seed=11711):
@@ -49,18 +85,27 @@ class SonnetGPT(nn.Module):
 
   def __init__(self, args):
     super().__init__()
-    self.use_flash_attn_kernel = getattr(args, "use_flash_attn_kernel", False)
-    self.use_longformer = getattr(args, "use_longformer", False)
-    self.gpt = GPT2Model.from_pretrained(
-      model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads,
-      use_flash_attn_kernel=self.use_flash_attn_kernel,
-      use_longformer=self.use_longformer
-    )
+    self.gpt = GPT2Model.from_pretrained(model=args.model_size, d=args.d, l=args.l, num_heads=args.num_heads)
     self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    # By default, fine-tune the full model. TODO: this is maybe not idea.
+    # By default, fine-tune the full model. TODO: this is maybe not idea. (TODO ADDRESSED)
     for param in self.gpt.parameters():
+      param.requires_grad = False
+
+    # unfreeze only the last 2 transformer blocks
+    blocks_to_unfreeze = 2
+    for layer in self.gpt.gpt_layers[-blocks_to_unfreeze:]:
+      for param in layer.parameters():
+        param.requires_grad = True
+
+    # unfreeze the final layer norm 
+    for param in self.gpt.final_layer_norm.parameters():
+      param.requires_grad = True
+      
+    # bc GPT-2 ties its output LM head weights to the input word embeddings 
+    # (see hidden_state_to_token) also unfreeze the word embeddings.
+    for param in self.gpt.word_embedding.parameters():
       param.requires_grad = True
 
   def forward(self, input_ids, attention_mask):
@@ -69,22 +114,24 @@ class SonnetGPT(nn.Module):
     not just the last token! This will allow our model to learn the natural language distribution that composes sonnets,
     not just the distribution over next tokens for the last token!
     """
-    gpt_out = self.gpt(
-      input_ids=input_ids,
-      attention_mask=attention_mask,
-      use_flash_attn_kernel=self.use_flash_attn_kernel,
-      use_longformer=self.use_longformer
-    )
-    logits = self.gpt.hidden_state_to_token(gpt_out["last_hidden_state"])
-    return logits
+    ### YOUR CODE HERE
+    # pass the inputs through the base GPT-2 model
+    outputs = self.gpt(input_ids, attention_mask)
 
+    # extract hidden states for all tokens
+    all_hidden_states = outputs["last_hidden_state"]
+
+    # project hidden states back to vocab size to get logits
+    logits = self.gpt.hidden_state_to_token(all_hidden_states)
+
+    return logits
 
   def get_device(self):
     for param in self.gpt.parameters():
       return param.device
 
   @torch.no_grad()
-  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128):
+  def generate(self, encoding, temperature=0.7, top_p=0.9, top_k=50, max_length=128):
     """
     Generates an original sonnet using top-p sampling and softmax temperature.
 
@@ -103,6 +150,16 @@ class SonnetGPT(nn.Module):
 
       # Convert logits to probabilities
       probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
+
+      # (TODO ADDRESSED)
+      if top_k > 0:
+          # get the top k probabilities and their thresholds
+          top_k_probs, _ = torch.topk(probs, top_k, dim=-1)
+          min_top_k_prob = top_k_probs[..., -1, None]
+          # zero out anything below the threshold
+          probs = torch.where(probs < min_top_k_prob, torch.zeros_like(probs), probs)
+          # re-normalize
+          probs /= probs.sum(dim=-1, keepdim=True)
 
       # Top-p (nucleus) sampling
       sorted_probs, sorted_indices = torch.sort(probs, descending=True)
@@ -163,6 +220,11 @@ def train(args):
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr)
 
+  # early stopping vars
+  best_loss = float('inf')
+  patience = 3 # stop after 3 epochs of no improvement
+  patience_counter = 0
+
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
     model.train()
@@ -189,6 +251,24 @@ def train(args):
 
     train_loss = train_loss / num_batches
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}.")
+
+    # (TODO ADDRESSED)
+    if train_loss < best_loss:
+        best_loss = train_loss
+        patience_counter = 0
+        
+        # only save the model when we hit a new best loss
+        dir_name = os.path.dirname(args.filepath)
+        base_name = os.path.basename(args.filepath)
+        best_save_path = os.path.join(dir_name, f"best_{base_name}")
+        save_model(model, optimizer, args, best_save_path)
+        print("New best model saved!")
+    else:
+        patience_counter += 1
+        if patience_counter >= patience:
+            print(f"Stopping early at epoch {epoch} to prevent overfitting.")
+            break
+
     print('Generating several output sonnets...')
     model.eval()
     for batch in held_out_sonnet_dataset:
@@ -197,13 +277,20 @@ def train(args):
       print(f'{batch[1]}{output[1]}\n\n')
 
     # TODO: consider a stopping condition to prevent overfitting on the small dataset of sonnets.
-    save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
+    # dir_name = os.path.dirname(args.filepath) # /root/results
+    # base_name = os.path.basename(args.filepath) # sonnet.pt
+    # current_save_path = os.path.join(dir_name, f"{epoch}_{base_name}")
+    # save_model(model, optimizer, args, current_save_path)
 
 
 @torch.no_grad()
 def generate_submission_sonnets(args):
+  dir_name = os.path.dirname(args.filepath)
+  base_name = os.path.basename(args.filepath)
+  load_path = os.path.join(dir_name, f"best_{base_name}")
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+  saved = torch.load(load_path, weights_only=False)
+  # saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
 
   model = SonnetGPT(saved['args'])
   model.load_state_dict(saved['model'])
@@ -230,122 +317,6 @@ def generate_submission_sonnets(args):
       f.write(f"\n{sonnet[0]}\n")
       f.write(sonnet[1])
 
-@torch.no_grad()
-def benchmark_run(args, label):
-  device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  if device.type != "cuda":
-    raise RuntimeError("benchmark_run requires --use_gpu")
-  saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
-
-  saved['args'].use_flash_attn_kernel = args.use_flash_attn_kernel
-  saved['args'].use_longformer = args.use_longformer
-
-  model = SonnetGPT(saved['args'])
-  model.load_state_dict(saved['model'])
-  model = model.to(device)
-  model.eval()
-  dtype = next(model.parameters()).dtype
-  ebytes = torch.finfo(dtype).bits // 8
-
-  sonnet_data = SonnetsDataset(args.sonnet_path)
-  sonnet_dataloader = DataLoader(
-    sonnet_data, shuffle=False, batch_size=args.batch_size,
-    collate_fn=sonnet_data.collate_fn
-  )
-
-  # Warmup
-  for batch in sonnet_dataloader:
-    b_ids = batch['token_ids'].to(device)
-    b_mask = batch['attention_mask'].to(device)
-    _ = model(b_ids, b_mask)
-    break
-  torch.cuda.synchronize()
-
-  results = []
-  for batch in tqdm(sonnet_dataloader, desc=f'benchmarking [{label}]'):
-    b_ids = batch['token_ids'].to(device)
-    b_mask = batch['attention_mask'].to(device)
-    seq_len = b_ids.shape[1]
-    batch_size = b_ids.shape[0]
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    _ = model(b_ids, b_mask)
-    end.record()
-    torch.cuda.synchronize()
-
-    latency_ms = start.elapsed_time(end)
-    tokens_per_sec = (batch_size * seq_len) / (latency_ms / 1000)
-    d, l = saved['args'].d, saved['args'].l
-    flops = 4 * (seq_len ** 2) * d * l * batch_size
-    tflops = (flops / (latency_ms / 1000)) / 1e12
-    mem_bytes = 3 * batch_size * saved['args'].num_heads * seq_len * (d // saved['args'].num_heads) * ebytes
-    mem_bytes += batch_size * saved['args'].num_heads * seq_len * (d // saved['args'].num_heads) * ebytes
-    mem_bytes += batch_size * saved['args'].num_heads * seq_len * 4
-    membw_tbs = (mem_bytes / (latency_ms / 1000)) / 1e12
-
-    results.append({
-      "seq_len": seq_len,
-      "latency_ms": latency_ms,
-      "tokens_per_sec": tokens_per_sec,
-      "tflops": tflops,
-      "membw_tbs": membw_tbs,
-      "label": label,
-    })
-
-  return results
-
-
-@torch.no_grad()
-def benchmark(args):
-  args.use_flash_attn_kernel = True
-  args.use_longformer = False
-  flash_results = benchmark_run(args, label='flash')
-
-  args.use_flash_attn_kernel = False
-  args.use_longformer = False
-  normal_results = benchmark_run(args, label='normal')
-
-  args.use_flash_attn_kernel = False
-  args.use_longformer = True
-  longformer_results = benchmark_run(args, label='longformer')
-
-  plot_benchmark(flash_results, normal_results, longformer_results)
-
-
-def plot_benchmark(flash_results, normal_results, longformer_results):
-  all_runs = [
-    (flash_results,      'flash',      'steelblue',  'o'),
-    (normal_results,     'normal',     'darkorange', 's'),
-    (longformer_results, 'longformer', 'seagreen',   '^'),
-  ]
-
-  metrics = [
-    ("latency_ms",     "Latency (ms)",            "Latency vs Sequence Length"),
-    ("tflops",         "TFLOP/s",                 "Compute Throughput vs Sequence Length"),
-    ("membw_tbs",      "Memory Bandwidth (TB/s)", "Memory Bandwidth vs Sequence Length"),
-    ("tokens_per_sec", "Tokens / Second",         "Tokens per Second vs Sequence Length"),
-  ]
-
-  fig, axes = plt.subplots(2, 2, figsize=(14, 10))
-  fig.suptitle("Sonnet Generation Benchmark — Flash vs Normal vs Longformer", fontsize=14, fontweight='bold')
-  axes = axes.flatten()
-
-  for ax, (key, ylabel, title) in zip(axes, metrics):
-    for results, label, color, marker in all_runs:
-      df = pd.DataFrame(results)
-      grouped = df.groupby("seq_len")[key].mean().reset_index()
-      ax.plot(grouped["seq_len"], grouped[key], color=color, marker=marker, label=label)
-    ax.set_title(title)
-    ax.set_xlabel("Sequence Length (padded)")
-    ax.set_ylabel(ylabel)
-    ax.legend()
-
-  plt.tight_layout()
-  plt.savefig("./output/L4/Sonnet_Benchmark_Results.png", dpi=150)
-  plt.show()
-
 
 def get_args():
   parser = argparse.ArgumentParser()
@@ -357,10 +328,6 @@ def get_args():
   parser.add_argument("--seed", type=int, default=11711)
   parser.add_argument("--epochs", type=int, default=10)
   parser.add_argument("--use_gpu", action='store_true')
-  parser.add_argument("--benchmark", action='store_true')
-
-  parser.add_argument("--use_flash_attn_kernel", action='store_true')
-  parser.add_argument("--use_longformer", action='store_true')
 
   # Generation parameters.
   parser.add_argument("--temperature", type=float, help="softmax temperature.", default=1.2)
@@ -396,11 +363,15 @@ def add_arguments(args):
 
 
 if __name__ == "__main__":
-  args = get_args()
-  args.filepath = f'{args.epochs}-{args.lr}-sonnet.pt'  # Save path.
-  seed_everything(args.seed)  # Fix the seed for reproducibility.
-  if args.benchmark:
-    benchmark(args)
-  else:
-    train(args)
-    generate_submission_sonnets(args)
+    args = get_args()
+    args.filepath = f'{args.epochs}-{args.lr}-sonnet.pt'
+    
+    if modal.is_local():
+        print("Launching on Modal GPU...")
+        with app.run():
+            train_remote.remote(vars(args)) # trigger modal w remote
+    else:
+        # run this inside cloud container
+        seed_everything(args.seed)
+        train(args)
+        generate_submission_sonnets(args)

@@ -1,0 +1,23 @@
+[project]
+name = "cs224n-gpt2"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "einops==0.8.0",
+    "explainaboard-client==0.0.7",
+    "filelock==3.0.12",
+    "importlib-metadata==3.7.0",
+    "matplotlib>=3.7.5",
+    "modal>=0.65.66",
+    "requests==2.25.1",
+    "sacrebleu==2.5.1",
+    "sklearn==0.0",
+    "tokenizers==0.20",
+    "torch>=2.5.1",
+    "torchaudio>=2.5.1",
+    "torchvision>=0.20.1",
+    "tqdm==4.58.0",
+    "transformers==4.46.3",
+]
