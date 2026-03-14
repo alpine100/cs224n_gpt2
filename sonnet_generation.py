@@ -107,8 +107,13 @@ class SonnetGPT(nn.Module):
     """
     ### YOUR CODE HERE
     outputs = self.gpt(input_ids, attention_mask)
-    hidden_states = outputs[0] if isinstance(outputs, tuple) else outputs
+    
+    # Extract the hidden states tensor from the dictionary
+    hidden_states = outputs["last_hidden_state"]
+    
+    # Pass the tensor through the linear head
     logits = self.lm_head(hidden_states)
+    
     return logits
 
 
