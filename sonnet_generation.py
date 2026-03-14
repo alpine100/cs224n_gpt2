@@ -343,7 +343,7 @@ def plot_benchmark(flash_results, normal_results, longformer_results):
     ax.legend()
 
   plt.tight_layout()
-  plt.savefig("Sonnet_Benchmark_Results.png", dpi=150)
+  plt.savefig("./output/L4/Sonnet_Benchmark_Results.png", dpi=150)
   plt.show()
 
 
