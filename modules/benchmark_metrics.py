@@ -171,6 +171,7 @@ class Benchmark:
                     ax.legend(fontsize=9)
 
             plt.tight_layout()
+            #to distinguish between paraphrase and sonnet dev
             tag_str = f"{tag}_" if tag else ""
             fname = os.path.join(save_path, f"{tag_str}Detailed benchmark_{mode.lower().replace(' ', '_')}.png")
             plt.savefig(fname, dpi=150, bbox_inches="tight")
