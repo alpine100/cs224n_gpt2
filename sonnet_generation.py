@@ -243,7 +243,10 @@ def train(args):
       print(f'{batch[1]}{output[1]}\n\n')
 
     # TODO: consider a stopping condition to prevent overfitting on the small dataset of sonnets.
-    save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
+    dir_name = os.path.dirname(args.filepath)
+    base_name = os.path.basename(args.filepath)
+    current_save_path = os.path.join(dir_name, f"{epoch}_{base_name}")
+    save_model(model, optimizer, args, current_save_path)
     
     if train_loss < best_train_loss - 0.01:
       best_train_loss = train_loss
