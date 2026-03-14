@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from benchmark_metrics import Benchmark
+from modules.benchmark_metrics import Benchmark
 #from triton.tools.tensor_descriptor import TensorDescriptor
 
 #DEVICE = triton.runtime.driver.active.get_active_torch_function()

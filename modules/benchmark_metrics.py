@@ -111,7 +111,7 @@ class Benchmark:
         return None, None
     
     @staticmethod
-    def plot_benchmark_results(save_path="../output/plots", show=True):
+    def plot_benchmark_results(save_path="../output/plots", show=True, tag=None):
         os.makedirs(save_path, exist_ok=True)
         df = pd.DataFrame(Benchmark.benchmarks)
 
@@ -171,7 +171,8 @@ class Benchmark:
                     ax.legend(fontsize=9)
 
             plt.tight_layout()
-            fname = os.path.join(save_path, f"Detailed benchmark_{mode.lower().replace(' ', '_')}.png")
+            tag_str = f"{tag}_" if tag else ""
+            fname = os.path.join(save_path, f"{tag_str}Detailed benchmark_{mode.lower().replace(' ', '_')}.png")
             plt.savefig(fname, dpi=150, bbox_inches="tight")
             print(f"Saved: {fname}")
             if show:

@@ -13,6 +13,7 @@ trains and evaluates your ParaphraseGPT model and writes the required submission
 
 import argparse
 import random
+import time
 import torch
 
 import numpy as np
@@ -31,6 +32,10 @@ from evaluation import model_eval_paraphrase, model_test_paraphrase
 from models.gpt2 import GPT2Model
 
 from optimizer import AdamW
+try:
+  from modules.benchmark_metrics import Benchmark
+except Exception:
+  Benchmark = None
 
 TQDM_DISABLE = False
 
@@ -95,6 +100,8 @@ def save_model(model, optimizer, args, filepath):
 def train(args):
   """Train GPT-2 for paraphrase detection on the Quora dataset."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+  if args.benchmark and Benchmark is None:
+    raise RuntimeError("benchmarking requested but modules/benchmark_metrics.py dependencies are missing")
   # Create the data and its corresponding datasets and dataloader.
   para_train_data = load_paraphrase_data(args.para_train)
   para_dev_data = load_paraphrase_data(args.para_dev)
@@ -115,11 +122,15 @@ def train(args):
   optimizer = AdamW(model.parameters(), lr=lr, weight_decay=0.)
   best_dev_acc = 0
 
+  wall_start = time.perf_counter()
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
     model.train()
     train_loss = 0
     num_batches = 0
+    total_ms = 0.0
+    total_tokens = 0
+    total_b = 0
     for batch in tqdm(para_train_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
       # Get the input and move it to the gpu (I do not recommend training this model on CPU).
       b_ids, b_mask, labels = batch['token_ids'], batch['attention_mask'], batch['labels'].flatten()
@@ -128,19 +139,40 @@ def train(args):
       labels = labels.to(device)
 
       # Compute the loss, gradients, and update the model's parameters.
+      if args.benchmark and device.type == "cuda":
+        torch.cuda.synchronize()
+      start = time.perf_counter()
       optimizer.zero_grad()
       logits = model(b_ids, b_mask)
       preds = torch.argmax(logits, dim=1)
       loss = F.cross_entropy(logits, labels, reduction='mean')
       loss.backward()
       optimizer.step()
+      if args.benchmark and device.type == "cuda":
+        torch.cuda.synchronize()
+      end = time.perf_counter()
 
       train_loss += loss.item()
       num_batches += 1
+      if args.benchmark:
+        total_ms += (end - start) * 1e3
+        total_tokens += b_ids.size(0) * b_ids.size(1)
+        total_b += b_ids.size(0)
 
     train_loss = train_loss / num_batches
 
     dev_acc, dev_f1, *_ = model_eval_paraphrase(para_dev_dataloader, model, device)
+
+    if args.benchmark and num_batches > 0:
+      avg_ms = total_ms / num_batches
+      avg_b = max(1, int(round(total_b / num_batches)))
+      avg_s = max(1, int(round(total_tokens / max(1, total_b))))
+      dtype = next(model.parameters()).dtype
+      Benchmark.report_metrics(
+        provider="paraphrase", mode="Back Prop",
+        B=avg_b, H=args.num_heads, S=avg_s, Dh=args.d // args.num_heads,
+        dtype=dtype, ms=avg_ms
+      )
 
     if dev_acc > best_dev_acc:
       best_dev_acc = dev_acc
@@ -148,14 +180,21 @@ def train(args):
 
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}, dev acc :: {dev_acc :.3f}")
 
+  wall_end = time.perf_counter()
+  if args.benchmark:
+    print(f"[Wall Clock] Paraphrase train total: {(wall_end - wall_start):.3f} s")
+
 
 @torch.no_grad()
 def test(args):
   """Evaluate your model on the dev and test datasets; save the predictions to disk."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+  if args.benchmark and Benchmark is None:
+    raise RuntimeError("benchmarking requested but modules/benchmark_metrics.py dependencies are missing")
   saved = torch.load(args.filepath, weights_only=False)
+  saved_args = saved['args']
 
-  model = ParaphraseGPT(saved['args'])
+  model = ParaphraseGPT(saved_args)
   model.load_state_dict(saved['model'])
   model = model.to(device)
   model.eval()
@@ -172,9 +211,40 @@ def test(args):
   para_test_dataloader = DataLoader(para_test_data, shuffle=True, batch_size=args.batch_size,
                                     collate_fn=para_test_data.collate_fn)
 
+  wall_start = time.perf_counter()
   dev_para_acc, _, dev_para_y_pred, _, dev_para_sent_ids = model_eval_paraphrase(para_dev_dataloader, model, device)
   print(f"dev paraphrase acc :: {dev_para_acc :.3f}")
+  if args.benchmark:
+    total_ms = 0.0
+    total_tokens = 0
+    total_b = 0
+    for batch in tqdm(para_dev_dataloader, desc="benchmark-dev", disable=TQDM_DISABLE):
+      b_ids, b_mask = batch['token_ids'].to(device), batch['attention_mask'].to(device)
+      if device.type == "cuda":
+        torch.cuda.synchronize()
+      start = time.perf_counter()
+      _ = model(b_ids, b_mask)
+      if device.type == "cuda":
+        torch.cuda.synchronize()
+      end = time.perf_counter()
+      total_ms += (end - start) * 1e3
+      total_tokens += b_ids.size(0) * b_ids.size(1)
+      total_b += b_ids.size(0)
+    num_batches = len(para_dev_dataloader)
+    if num_batches > 0:
+      avg_ms = total_ms / num_batches
+      avg_b = max(1, int(round(total_b / num_batches)))
+      avg_s = max(1, int(round(total_tokens / max(1, total_b))))
+      dtype = next(model.parameters()).dtype
+      Benchmark.report_metrics(
+        provider="paraphrase", mode="Forward Pass",
+        B=avg_b, H=saved_args.num_heads, S=avg_s, Dh=saved_args.d // saved_args.num_heads,
+        dtype=dtype, ms=avg_ms
+      )
   test_para_y_pred, test_para_sent_ids = model_test_paraphrase(para_test_dataloader, model, device)
+  wall_end = time.perf_counter()
+  if args.benchmark:
+    print(f"[Wall Clock] Paraphrase eval total: {(wall_end - wall_start):.3f} s")
 
   with open(args.para_dev_out, "w+") as f:
     f.write(f"id \t Predicted_Is_Paraphrase \n")
@@ -185,6 +255,9 @@ def test(args):
     f.write(f"id \t Predicted_Is_Paraphrase \n")
     for p, s in zip(test_para_sent_ids, test_para_y_pred):
       f.write(f"{p}, {s} \n")
+
+  if args.benchmark:
+    Benchmark.plot_benchmark_results(save_path="output/plots", show=False, tag="paraphrase")
 
 
 def get_args():
@@ -199,6 +272,7 @@ def get_args():
   parser.add_argument("--seed", type=int, default=11711)
   parser.add_argument("--epochs", type=int, default=10)
   parser.add_argument("--use_gpu", action='store_true')
+  parser.add_argument("--benchmark", action='store_true')
 
   parser.add_argument("--batch_size", help='sst: 64, cfimdb: 8 can fit a 12GB GPU', type=int, default=8)
   parser.add_argument("--lr", type=float, help="learning rate", default=1e-5)

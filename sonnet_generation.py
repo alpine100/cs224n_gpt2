@@ -9,6 +9,7 @@ trains your SonnetGPT model and writes the required submission files.
 
 import argparse
 import random
+import time
 import torch
 
 import numpy as np
@@ -26,6 +27,10 @@ from datasets import (
 from models.gpt2 import GPT2Model
 
 from optimizer import AdamW
+try:
+  from modules.benchmark_metrics import Benchmark
+except Exception:
+  Benchmark = None
 
 TQDM_DISABLE = False
 
@@ -69,7 +74,7 @@ class SonnetGPT(nn.Module):
       return param.device
 
   @torch.no_grad()
-  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128):
+  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128, benchmark_stats=None):
     """
     Generates an original sonnet using top-p sampling and softmax temperature.
 
@@ -83,7 +88,17 @@ class SonnetGPT(nn.Module):
 
     for _ in range(max_length):
       # Forward pass to get logits
+      if benchmark_stats is not None and self.get_device().type == "cuda":
+        torch.cuda.synchronize()
+      start = time.perf_counter()
       logits_sequence = self.forward(token_ids, attention_mask)
+      if benchmark_stats is not None and self.get_device().type == "cuda":
+        torch.cuda.synchronize()
+      end = time.perf_counter()
+      if benchmark_stats is not None:
+        benchmark_stats["total_ms"] += (end - start) * 1e3
+        benchmark_stats["total_tokens"] += token_ids.size(0) * token_ids.size(1)
+        benchmark_stats["total_b"] += token_ids.size(0)
       logits_last_token = logits_sequence[:, -1, :] / temperature  # Apply temperature scaling
 
       # Convert logits to probabilities
@@ -133,6 +148,8 @@ def save_model(model, optimizer, args, filepath):
 def train(args):
   """Train GPT-2 for paraphrase detection on the Quora dataset."""
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+  if args.benchmark and Benchmark is None:
+    raise RuntimeError("benchmarking requested but modules/benchmark_metrics.py dependencies are missing")
   # Create the data and its corresponding datasets and dataloader.
   sonnet_dataset = SonnetsDataset(args.sonnet_path)
   sonnet_dataloader = DataLoader(sonnet_dataset, shuffle=True, batch_size=args.batch_size,
@@ -148,11 +165,15 @@ def train(args):
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr)
 
+  wall_start = time.perf_counter()
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
     model.train()
     train_loss = 0
     num_batches = 0
+    total_ms = 0.0
+    total_tokens = 0
+    total_b = 0
 
     for batch in tqdm(sonnet_dataloader, desc=f'train-{epoch}', disable=TQDM_DISABLE):
       # Get the input and move it to the gpu (I do not recommend training this model on CPU).
@@ -161,6 +182,9 @@ def train(args):
       b_mask = b_mask.to(device)
 
       # Compute the loss, gradients, and update the model's parameters.
+      if args.benchmark and device.type == "cuda":
+        torch.cuda.synchronize()
+      start = time.perf_counter()
       optimizer.zero_grad()
       logits = model(b_ids, b_mask)
       logits = rearrange(logits[:, :-1].contiguous(), 'b t d -> (b t) d')  # Ignore the last prediction in the sequence.
@@ -168,29 +192,71 @@ def train(args):
       loss = F.cross_entropy(logits, labels, reduction='mean')
       loss.backward()
       optimizer.step()
+      if args.benchmark and device.type == "cuda":
+        torch.cuda.synchronize()
+      end = time.perf_counter()
 
       train_loss += loss.item()
       num_batches += 1
+      if args.benchmark:
+        total_ms += (end - start) * 1e3
+        total_tokens += b_ids.size(0) * b_ids.size(1)
+        total_b += b_ids.size(0)
 
     train_loss = train_loss / num_batches
+    if args.benchmark and num_batches > 0:
+      avg_ms = total_ms / num_batches
+      avg_b = max(1, int(round(total_b / num_batches)))
+      avg_s = max(1, int(round(total_tokens / max(1, total_b))))
+      dtype = next(model.parameters()).dtype
+      Benchmark.report_metrics(
+        provider="sonnet", mode="Back Prop",
+        B=avg_b, H=args.num_heads, S=avg_s, Dh=args.d // args.num_heads,
+        dtype=dtype, ms=avg_ms
+      )
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}.")
     print('Generating several output sonnets...')
     model.eval()
+    bench_stats = None
+    if args.benchmark:
+      bench_stats = {"total_ms": 0.0, "total_tokens": 0, "total_b": 0}
     for batch in held_out_sonnet_dataset:
       encoding = model.tokenizer(batch[1], return_tensors='pt', padding=True, truncation=True).to(device)
-      output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)
+      output = model.generate(
+        encoding['input_ids'],
+        temperature=args.temperature,
+        top_p=args.top_p,
+        benchmark_stats=bench_stats
+      )
       print(f'{batch[1]}{output[1]}\n\n')
+    if args.benchmark and bench_stats["total_b"] > 0:
+      avg_ms = bench_stats["total_ms"] / max(1, len(held_out_sonnet_dataset))
+      avg_b = max(1, int(round(bench_stats["total_b"] / max(1, len(held_out_sonnet_dataset)))))
+      avg_s = max(1, int(round(bench_stats["total_tokens"] / max(1, bench_stats["total_b"]))))
+      dtype = next(model.parameters()).dtype
+      Benchmark.report_metrics(
+        provider="sonnet", mode="Forward Pass",
+        B=avg_b, H=args.num_heads, S=avg_s, Dh=args.d // args.num_heads,
+        dtype=dtype, ms=avg_ms
+      )
 
     # TODO: consider a stopping condition to prevent overfitting on the small dataset of sonnets.
     save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
+
+  wall_end = time.perf_counter()
+  if args.benchmark:
+    print(f"[Wall Clock] Sonnet train total: {(wall_end - wall_start):.3f} s")
 
 
 @torch.no_grad()
 def generate_submission_sonnets(args):
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+  if args.benchmark and Benchmark is None:
+    raise RuntimeError("benchmarking requested but modules/benchmark_metrics.py dependencies are missing")
   saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+  saved_args = saved['args']
 
-  model = SonnetGPT(saved['args'])
+  model = SonnetGPT(saved_args)
   model.load_state_dict(saved['model'])
   model = model.to(device)
   model.eval()
@@ -198,22 +264,46 @@ def generate_submission_sonnets(args):
   # Create the held-out dataset: these only have the first 3 lines. Your job is to fill in the rest!
   held_out_sonnet_dataset = SonnetsDataset(args.held_out_sonnet_path)
 
+  wall_start = time.perf_counter()
   generated_sonnets = []
+  bench_stats = None
+  if args.benchmark:
+    bench_stats = {"total_ms": 0.0, "total_tokens": 0, "total_b": 0}
   for batch in held_out_sonnet_dataset:
     sonnet_id = batch[0]
     encoding = model.tokenizer(batch[1], return_tensors='pt', padding=False, truncation=True).to(device)
-    output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)[0][0]
+    output = model.generate(
+      encoding['input_ids'],
+      temperature=args.temperature,
+      top_p=args.top_p,
+      benchmark_stats=bench_stats
+    )[0][0]
     decoded_output = model.tokenizer.decode(output)
     full_sonnet = f'{decoded_output}\n\n'
     generated_sonnets.append((sonnet_id, full_sonnet))
 
     print(f'{decoded_output}\n\n')
+  if args.benchmark and bench_stats["total_b"] > 0:
+    avg_ms = bench_stats["total_ms"] / max(1, len(held_out_sonnet_dataset))
+    avg_b = max(1, int(round(bench_stats["total_b"] / max(1, len(held_out_sonnet_dataset)))))
+    avg_s = max(1, int(round(bench_stats["total_tokens"] / max(1, bench_stats["total_b"]))))
+    dtype = next(model.parameters()).dtype
+    Benchmark.report_metrics(
+      provider="sonnet", mode="Forward Pass",
+      B=avg_b, H=saved_args.num_heads, S=avg_s, Dh=saved_args.d // saved_args.num_heads,
+      dtype=dtype, ms=avg_ms
+    )
 
   with open(args.sonnet_out, "w+") as f:
     f.write(f"--Generated Sonnets-- \n\n")
     for sonnet in generated_sonnets:
       f.write(f"\n{sonnet[0]}\n")
       f.write(sonnet[1])
+
+  if args.benchmark:
+    Benchmark.plot_benchmark_results(save_path="output/plots", show=False, tag="sonnet")
+    wall_end = time.perf_counter()
+    print(f"[Wall Clock] Sonnet generate total: {(wall_end - wall_start):.3f} s")
 
 
 def get_args():
@@ -226,6 +316,7 @@ def get_args():
   parser.add_argument("--seed", type=int, default=11711)
   parser.add_argument("--epochs", type=int, default=10)
   parser.add_argument("--use_gpu", action='store_true')
+  parser.add_argument("--benchmark", action='store_true')
 
   # Generation parameters.
   parser.add_argument("--temperature", type=float, help="softmax temperature.", default=1.2)

@@ -1,7 +1,15 @@
+import math
 import torch
 
 from einops import rearrange
 from torch import nn
+
+try:
+  from modules.flash_attention import forward_attention_compute
+  _FLASH_AVAILABLE = True
+except Exception:
+  forward_attention_compute = None
+  _FLASH_AVAILABLE = False
 
 
 class CausalSelfAttention(nn.Module):
@@ -34,33 +42,27 @@ class CausalSelfAttention(nn.Module):
   def attention(self, key, query, value, attention_mask):
 
     ### YOUR CODE HERE
-    #check if nn.Module training attr is set before applying dropout
+    # check if nn.Module training attr is set before applying dropout
     dropout_p = self.dropout.p if self.training else 0
-    #key positions (s)
     S = key.size(-2)
-    # Create causal mask on the same device and with the same dtype as attention_mask
-    causal_mask = torch.triu(torch.full((S, S), -10000.0, device=attention_mask.device, dtype=attention_mask.dtype), diagonal=1)
-    
-    # longformer mask 
-    window_size = 512 # cite
-    window_mask = torch.triu(torch.full((S, S), -10000.0, device=attention_mask.device, dtype=attention_mask.dtype), diagonal=-window_size)
-    
-    # combine masks together
-    longformer_mask = causal_mask + window_mask
 
-    # longformer global attention
-    resulting_mask = longformer_mask + attention_mask
+    # Use flash attention only for inference with no padding.
+    no_padding = attention_mask is None or torch.all(attention_mask == 0)
+    if (not self.training) and _FLASH_AVAILABLE and no_padding and query.is_cuda:
+      sm_scale = 1.0 / math.sqrt(self.attention_head_size)
+      attn_output, _ = forward_attention_compute(query, key, value, sm_scale)
+      return rearrange(attn_output, 'b h t d -> b t (h d)')
 
-    # attention_mask = causal mask (s,s) + padding(bs,h,query_positions,key_positions(s))
-    #                  add padding to respective cols in mask
-    # resulting_mask = causal_mask + attention_mask
-
-    attention_output = nn.functional.scaled_dot_product_attention(query, key, value, attn_mask=resulting_mask, dropout_p=dropout_p)
-    
-    # convert from (bs, num_heads, seq_len, head_dim) to (bs, seq_len, hidden_size)
-    result = rearrange(attention_output, 'b h t d -> b t (h d)')
-
-    return result
+    # Fallback: causal + padding mask with SDPA.
+    causal_mask = torch.triu(
+      torch.full((S, S), -10000.0, device=attention_mask.device, dtype=attention_mask.dtype),
+      diagonal=1
+    )
+    resulting_mask = causal_mask + attention_mask
+    attention_output = nn.functional.scaled_dot_product_attention(
+      query, key, value, attn_mask=resulting_mask, dropout_p=dropout_p
+    )
+    return rearrange(attention_output, 'b h t d -> b t (h d)')
 
 
   def forward(self, hidden_states, attention_mask):
