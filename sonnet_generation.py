@@ -93,12 +93,6 @@ class SonnetGPT(nn.Module):
     for param in self.gpt.parameters():
       param.requires_grad = False
 
-    # unfreeze only the last 4 transformer blocks
-    blocks_to_unfreeze = 4
-    for layer in self.gpt.gpt_layers[-blocks_to_unfreeze:]:
-      for param in layer.parameters():
-        param.requires_grad = True
-
     # unfreeze the final layer norm 
     for param in self.gpt.final_layer_norm.parameters():
       param.requires_grad = True
