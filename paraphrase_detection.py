@@ -53,13 +53,15 @@ class ParaphraseGPT(nn.Module):
 
   def __init__(self, args):
     super().__init__()
+    self.use_flash_attn_kernel = getattr(args, "use_flash_attn_kernel", False)
+    self.use_longformer = getattr(args, "use_longformer", False)
     self.gpt = GPT2Model.from_pretrained(
       model=args.model_size,
       d=args.d,
       l=args.l,
       num_heads=args.num_heads,
-      use_flash_attn_kernel=args.use_flash_attn_kernel,
-      use_longformer=args.use_longformer
+      use_flash_attn_kernel=self.use_flash_attn_kernel,
+      use_longformer=self.use_longformer
     )
     self.paraphrase_detection_head = nn.Linear(args.d, 2)  # Paraphrase detection has two outputs: 1 (yes) or 0 (no).
 
@@ -84,8 +86,8 @@ class ParaphraseGPT(nn.Module):
     gpt_out = self.gpt(
       input_ids=input_ids, 
       attention_mask=attention_mask, 
-      use_flash_attn_kernel=use_flash_attn_kernel,
-      use_longformer=use_longformer
+      use_flash_attn_kernel=self.use_flash_attn_kernel,
+      use_longformer=self.use_longformer
     )
     last_hidden = gpt_out["last_token"]
     logits = self.gpt.hidden_state_to_token(last_hidden)
@@ -204,6 +206,8 @@ def test(args):
 @torch.no_grad()
 def benchmark_run(args, label):
     device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+    if device.type != "cuda":
+        raise RuntimeError("benchmark_run requires --use_gpu")
     saved = torch.load(args.filepath, weights_only=False)
 
     # BUG FIX: merge current flags into saved args so attention mode is respected
@@ -361,5 +365,8 @@ if __name__ == "__main__":
   args = get_args()
   args.filepath = f'{args.epochs}-{args.lr}-paraphrase.pt'  # Save path.
   seed_everything(args.seed)  # Fix the seed for reproducibility.
-  train(args)
-  test(args)
+  if args.benchmark:
+    benchmark(args)
+  else:
+    train(args)
+    test(args)

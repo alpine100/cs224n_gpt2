@@ -63,7 +63,7 @@ class GPT2Model(GPTPreTrainedModel):
     return embeddings
 
 
-  def encode(self, hidden_states, attention_mask):
+  def encode(self, hidden_states, attention_mask, use_flash_attn_kernel=False, use_longformer=False):
     """
     hidden_states: the output from the embedding layer [batch_size, seq_len, hidden_size]
     attention_mask: [batch_size, seq_len]
@@ -77,11 +77,16 @@ class GPT2Model(GPTPreTrainedModel):
     # Pass the hidden states through the encoder layers.
     for i, layer_module in enumerate(self.gpt_layers):
       # Feed the encoding from the last bert_layer to the next.
-      hidden_states = layer_module(hidden_states, extended_attention_mask)
+      hidden_states = layer_module(
+        hidden_states,
+        extended_attention_mask,
+        use_flash_attn_kernel=use_flash_attn_kernel,
+        use_longformer=use_longformer
+      )
 
     return hidden_states
 
-  def forward(self, input_ids, attention_mask):
+  def forward(self, input_ids, attention_mask, use_flash_attn_kernel=False, use_longformer=False):
     """
     input_ids: [batch_size, seq_len], seq_len is the max length of the batch
     attention_mask: same size as input_ids, 1 represents non-padding tokens, 0 represents padding tokens
@@ -90,7 +95,12 @@ class GPT2Model(GPTPreTrainedModel):
     embedding_output = self.embed(input_ids=input_ids)
 
     # Feed to a transformer (a stack of GPTLayers).
-    sequence_output = self.encode(embedding_output, attention_mask=attention_mask)
+    sequence_output = self.encode(
+      embedding_output,
+      attention_mask=attention_mask,
+      use_flash_attn_kernel=use_flash_attn_kernel,
+      use_longformer=use_longformer
+    )
     sequence_output = self.final_layer_norm(sequence_output)
 
     # Get the hidden state of the final token.
@@ -112,10 +122,17 @@ class GPT2Model(GPTPreTrainedModel):
 
 
   @classmethod
-  def from_pretrained(cls, model='gpt2', d=768, l=12, num_heads=12):
+  def from_pretrained(cls, model='gpt2', d=768, l=12, num_heads=12,
+                      use_flash_attn_kernel=False, use_longformer=False):
     gpt_model = OpenAIGPT2Model.from_pretrained(model).eval()
-    our_model = GPT2Model(GPT2Config(hidden_size=d, num_hidden_layers=l,num_attention_heads=num_heads,
-                                     intermediate_size=d*3)).eval()
+    our_model = GPT2Model(GPT2Config(
+      hidden_size=d,
+      num_hidden_layers=l,
+      num_attention_heads=num_heads,
+      intermediate_size=d*3,
+      use_flash_attn_kernel=use_flash_attn_kernel,
+      use_longformer=use_longformer
+    )).eval()
 
     # Load word and positional embeddings.
     our_model.word_embedding.load_state_dict(gpt_model.wte.state_dict())
