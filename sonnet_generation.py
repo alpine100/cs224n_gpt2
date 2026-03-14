@@ -26,10 +26,48 @@ from datasets import (
 from models.gpt2 import GPT2Model
 
 from optimizer import AdamW
-from argparse import Namespace
-import os
 
 TQDM_DISABLE = False
+
+import modal
+import os
+from argparse import Namespace
+
+# set up modal app
+app = modal.App("sonnet-generator")
+volume = modal.Volume.from_name("sonnet-results", create_if_missing=True)
+
+image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("torch", "transformers", "einops", "tqdm", "numpy", "importlib-metadata", "requests")
+    .add_local_dir(".", remote_path="/root", copy=False) 
+)
+
+@app.function(
+    gpu="A10G",
+    image=image,
+    volumes={"/root/results": volume},
+    timeout=3600
+)
+
+def train_remote(args_dict):
+    args = Namespace(**args_dict)
+    os.chdir("/root")
+
+    # set params
+    args.use_gpu = True
+    args.batch_size = 32
+    args.lr = 5e-5
+    args.sonnet_out = "/root/results/generated_sonnets_dev.txt"
+    args.filepath = f"/root/results/{args.epochs}-{args.lr}-sonnet.pt"
+    
+    # now run standard logic
+    seed_everything(args.seed)
+    train(args)
+    generate_submission_sonnets(args)
+    
+    volume.commit() 
+    print("Training complete and files saved to Volume.")
 
 # Fix the random seed.
 def seed_everything(seed=11711):
@@ -222,11 +260,6 @@ def train(args):
         # only save the model when we hit a new best loss
         dir_name = os.path.dirname(args.filepath)
         base_name = os.path.basename(args.filepath)
-        
-        # ensure directory exists before saving
-        if dir_name and not os.path.exists(dir_name):
-            os.makedirs(dir_name)
-            
         best_save_path = os.path.join(dir_name, f"best_{base_name}")
         save_model(model, optimizer, args, best_save_path)
         print("New best model saved!")
@@ -243,6 +276,13 @@ def train(args):
       output = model.generate(encoding['input_ids'], temperature=args.temperature, top_p=args.top_p)
       print(f'{batch[1]}{output[1]}\n\n')
 
+    # TODO: consider a stopping condition to prevent overfitting on the small dataset of sonnets.
+    # dir_name = os.path.dirname(args.filepath) # /root/results
+    # base_name = os.path.basename(args.filepath) # sonnet.pt
+    # current_save_path = os.path.join(dir_name, f"{epoch}_{base_name}")
+    # save_model(model, optimizer, args, current_save_path)
+
+
 @torch.no_grad()
 def generate_submission_sonnets(args):
   dir_name = os.path.dirname(args.filepath)
@@ -250,6 +290,7 @@ def generate_submission_sonnets(args):
   load_path = os.path.join(dir_name, f"best_{base_name}")
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
   saved = torch.load(load_path, weights_only=False)
+  # saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
 
   model = SonnetGPT(saved['args'])
   model.load_state_dict(saved['model'])
@@ -267,6 +308,7 @@ def generate_submission_sonnets(args):
     # truncate if too long
     decoded_output = model.tokenizer.decode(output)
     lines = decoded_output.split('\n')
+    lines = [line.strip() for line in lines if line.strip()]
     if len(lines) > 14:
         lines = lines[:14]
     decoded_output = '\n'.join(lines)
@@ -274,11 +316,6 @@ def generate_submission_sonnets(args):
     generated_sonnets.append((sonnet_id, full_sonnet))
 
     print(f'{decoded_output}\n\n')
-    
-  # ensure output dir exists
-  out_dir = os.path.dirname(args.sonnet_out)
-  if out_dir and not os.path.exists(out_dir):
-      os.makedirs(out_dir)
 
   with open(args.sonnet_out, "w+") as f:
     f.write(f"--Generated Sonnets-- \n\n")
@@ -335,7 +372,12 @@ if __name__ == "__main__":
     args = get_args()
     args.filepath = f'{args.epochs}-{args.lr}-sonnet.pt'
     
-    # Run natively on the cloud container/VM
-    seed_everything(args.seed)
-    train(args)
-    generate_submission_sonnets(args)
+    if modal.is_local():
+        print("Launching on Modal GPU...")
+        with app.run():
+            train_remote.remote(vars(args)) # trigger modal w remote
+    else:
+        # run this inside cloud container
+        seed_everything(args.seed)
+        train(args)
+        generate_submission_sonnets(args)
