@@ -79,7 +79,7 @@ class SonnetGPT(nn.Module):
       return param.device
 
   @torch.no_grad()
-  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128):
+  def generate(self, encoding, temperature=0.7, top_k=50, top_p=0.9, max_length=128):
     """
     Generates an original sonnet using top-p sampling and softmax temperature.
 
@@ -95,6 +95,10 @@ class SonnetGPT(nn.Module):
       # Forward pass to get logits
       logits_sequence = self.forward(token_ids, attention_mask)
       logits_last_token = logits_sequence[:, -1, :] / temperature  # Apply temperature scaling
+
+      if top_k > 0:
+        indices_to_remove = logits_last_token < torch.topk(logits_last_token, top_k)[0][..., -1, None]
+        logits_last_token[indices_to_remove] = -float('Inf')
 
       # Convert logits to probabilities
       probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
@@ -230,7 +234,7 @@ def get_args():
   parser = argparse.ArgumentParser()
 
   parser.add_argument("--sonnet_path", type=str, default="data/sonnets.txt")
-  parser.add_argument("--held_out_sonnet_path", type=str, default="data/sonnets_held_out.txt")
+  parser.add_argument("--held_out_sonnet_path", type=str, default="data/sonnets_held_out_dev.txt")
   parser.add_argument("--sonnet_out", type=str, default="predictions/generated_sonnets_dev.txt")
 
   parser.add_argument("--seed", type=int, default=11711)
