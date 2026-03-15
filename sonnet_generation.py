@@ -11,6 +11,9 @@ import argparse
 import random
 import torch
 
+import matplotlib.pyplot as plt
+import pandas as pd
+
 import numpy as np
 import torch.nn.functional as F
 
@@ -230,6 +233,122 @@ def generate_submission_sonnets(args):
       f.write(sonnet[1])
 
 
+@torch.no_grad()
+def benchmark_run(args, label):
+  device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
+  if device.type != "cuda":
+    raise RuntimeError("benchmark_run requires --use_gpu")
+  saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+
+  saved['args'].use_flash_attn_kernel = args.use_flash_attn_kernel
+  saved['args'].use_longformer = args.use_longformer
+
+  model = SonnetGPT(saved['args'])
+  model.load_state_dict(saved['model'])
+  model = model.to(device)
+  model.eval()
+  dtype = next(model.parameters()).dtype
+  ebytes = torch.finfo(dtype).bits // 8
+
+  sonnet_data = SonnetsDataset(args.sonnet_path)
+  sonnet_dataloader = DataLoader(
+    sonnet_data, shuffle=False, batch_size=args.batch_size,
+    collate_fn=sonnet_data.collate_fn
+  )
+
+  # Warmup
+  for batch in sonnet_dataloader:
+    b_ids = batch['token_ids'].to(device)
+    b_mask = batch['attention_mask'].to(device)
+    _ = model(b_ids, b_mask)
+    break
+  torch.cuda.synchronize()
+
+  results = []
+  for batch in tqdm(sonnet_dataloader, desc=f'benchmarking [{label}]'):
+    b_ids = batch['token_ids'].to(device)
+    b_mask = batch['attention_mask'].to(device)
+    seq_len = b_ids.shape[1]
+    batch_size = b_ids.shape[0]
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    _ = model(b_ids, b_mask)
+    end.record()
+    torch.cuda.synchronize()
+
+    latency_ms = start.elapsed_time(end)
+    tokens_per_sec = (batch_size * seq_len) / (latency_ms / 1000)
+    d, l = saved['args'].d, saved['args'].l
+    flops = 4 * (seq_len ** 2) * d * l * batch_size
+    tflops = (flops / (latency_ms / 1000)) / 1e12
+    mem_bytes = 3 * batch_size * saved['args'].num_heads * seq_len * (d // saved['args'].num_heads) * ebytes
+    mem_bytes += batch_size * saved['args'].num_heads * seq_len * (d // saved['args'].num_heads) * ebytes
+    mem_bytes += batch_size * saved['args'].num_heads * seq_len * 4
+    membw_tbs = (mem_bytes / (latency_ms / 1000)) / 1e12
+
+    results.append({
+      "seq_len": seq_len,
+      "latency_ms": latency_ms,
+      "tokens_per_sec": tokens_per_sec,
+      "tflops": tflops,
+      "membw_tbs": membw_tbs,
+      "label": label,
+    })
+
+  return results
+
+
+@torch.no_grad()
+def benchmark(args):
+  args.use_flash_attn_kernel = True
+  args.use_longformer = False
+  flash_results = benchmark_run(args, label='flash')
+
+  args.use_flash_attn_kernel = False
+  args.use_longformer = False
+  normal_results = benchmark_run(args, label='normal')
+
+  args.use_flash_attn_kernel = False
+  args.use_longformer = True
+  longformer_results = benchmark_run(args, label='longformer')
+
+  plot_benchmark(flash_results, normal_results, longformer_results)
+
+
+def plot_benchmark(flash_results, normal_results, longformer_results):
+  all_runs = [
+    (flash_results,      'flash',      'steelblue',  'o'),
+    (normal_results,     'normal',     'darkorange', 's'),
+    (longformer_results, 'longformer', 'seagreen',   '^'),
+  ]
+
+  metrics = [
+    ("latency_ms",     "Latency (ms)",            "Latency vs Sequence Length"),
+    ("tflops",         "TFLOP/s",                 "Compute Throughput vs Sequence Length"),
+    ("membw_tbs",      "Memory Bandwidth (TB/s)", "Memory Bandwidth vs Sequence Length"),
+    ("tokens_per_sec", "Tokens / Second",         "Tokens per Second vs Sequence Length"),
+  ]
+
+  fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+  fig.suptitle("Sonnet Generation Benchmark — Flash vs Normal vs Longformer", fontsize=14, fontweight='bold')
+  axes = axes.flatten()
+
+  for ax, (key, ylabel, title) in zip(axes, metrics):
+    for results, label, color, marker in all_runs:
+      df = pd.DataFrame(results)
+      grouped = df.groupby("seq_len")[key].mean().reset_index()
+      ax.plot(grouped["seq_len"], grouped[key], color=color, marker=marker, label=label)
+    ax.set_title(title)
+    ax.set_xlabel("Sequence Length (padded)")
+    ax.set_ylabel(ylabel)
+    ax.legend()
+
+  plt.tight_layout()
+  plt.savefig("./output/H100/Sonnet_Benchmark_Results.png", dpi=150)
+  plt.show()
+
 def get_args():
   parser = argparse.ArgumentParser()
 
@@ -240,6 +359,9 @@ def get_args():
   parser.add_argument("--seed", type=int, default=11711)
   parser.add_argument("--epochs", type=int, default=10)
   parser.add_argument("--use_gpu", action='store_true')
+  parser.add_argument("--benchmark", action='store_true')
+  parser.add_argument("--use_flash_attn_kernel", action='store_true')
+  parser.add_argument("--use_longformer", action='store_true')
 
   # Generation parameters.
   parser.add_argument("--temperature", type=float, help="softmax temperature.", default=1.2)
@@ -278,7 +400,7 @@ app = modal.App("sonnet-generator")
 # define environment
 image = (
     modal.Image.debian_slim()
-    .pip_install("torch", "torchvision", "torchaudio", "tqdm==4.58.0", "requests==2.25.1", "importlib-metadata==3.7.0", "filelock==3.0.12", "sklearn==0.0", "tokenizers==0.20", "explainaboard-client==0.0.7", "einops==0.8.0", "transformers==4.46.3", "sacrebleu==2.5.1", "matplotlib>=3.7.5", "pronouncing>=0.2.0")
+    .pip_install("torch", "torchvision", "torchaudio", "triton","tqdm==4.58.0", "requests==2.25.1", "importlib-metadata==3.7.0", "filelock==3.0.12", "sklearn==0.0", "tokenizers==0.20", "explainaboard-client==0.0.7", "einops==0.8.0", "transformers==4.46.3", "sacrebleu==2.5.1", "matplotlib>=3.7.5", "pronouncing>=0.2.0")
     .env({"PYTHONPATH": "/root/project"})
     .add_local_dir("data", remote_path="/root/project/data", ignore=["*.pt", "__pycache__", ".venv"])
     .add_local_dir("models", remote_path="/root/project/models", ignore=["*.pt", "__pycache__", ".venv"])
@@ -310,8 +432,16 @@ def run_on_modal(args):
     
     # run original pipeline
     seed_everything(args.seed)
-    train(args)
-    generate_submission_sonnets(args)
+    
+    if args.benchmark:
+      benchmark(args)
+      return None, None, None
+    else:
+      train(args)
+      generate_submission_sonnets(args)
+
+    #train(args)
+    #generate_submission_sonnets(args)
     
     # read the generated outputs to return them to local machine
     with open(args.sonnet_out, "r") as f:
