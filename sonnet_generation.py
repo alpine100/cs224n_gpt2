@@ -31,43 +31,6 @@ TQDM_DISABLE = False
 
 import modal
 import os
-from argparse import Namespace
-
-# set up modal app
-app = modal.App("sonnet-generator")
-volume = modal.Volume.from_name("sonnet-results", create_if_missing=True)
-
-image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch", "transformers", "einops", "tqdm", "numpy", "importlib-metadata", "requests")
-    .add_local_dir(".", remote_path="/root", copy=False) 
-)
-
-@app.function(
-    gpu="H100",
-    image=image,
-    volumes={"/root/results": volume},
-    timeout=3600
-)
-
-def train_remote(args_dict):
-    args = Namespace(**args_dict)
-    os.chdir("/root")
-
-    # set params
-    args.use_gpu = True
-    args.batch_size = 32
-    args.lr = 5e-5
-    args.sonnet_out = "/root/results/generated_sonnets_dev.txt"
-    args.filepath = f"/root/results/{args.epochs}-{args.lr}-sonnet.pt"
-    
-    # now run standard logic
-    seed_everything(args.seed)
-    train(args)
-    generate_submission_sonnets(args)
-    
-    volume.commit() 
-    print("Training complete and files saved to Volume.")
 
 # Fix the random seed.
 def seed_everything(seed=11711):
@@ -89,23 +52,8 @@ class SonnetGPT(nn.Module):
     self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    # By default, fine-tune the full model. TODO: this is maybe not idea. (TODO ADDRESSED)
+    # By default, fine-tune the full model. TODO: this is maybe not idea.
     for param in self.gpt.parameters():
-      param.requires_grad = False
-
-    # unfreeze only the last 2 transformer blocks
-    blocks_to_unfreeze = 2
-    for layer in self.gpt.gpt_layers[-blocks_to_unfreeze:]:
-      for param in layer.parameters():
-        param.requires_grad = True
-
-    # unfreeze the final layer norm 
-    for param in self.gpt.final_layer_norm.parameters():
-      param.requires_grad = True
-      
-    # bc GPT-2 ties its output LM head weights to the input word embeddings 
-    # (see hidden_state_to_token) also unfreeze the word embeddings.
-    for param in self.gpt.word_embedding.parameters():
       param.requires_grad = True
 
   def forward(self, input_ids, attention_mask):
@@ -131,7 +79,7 @@ class SonnetGPT(nn.Module):
       return param.device
 
   @torch.no_grad()
-  def generate(self, encoding, temperature=0.7, top_p=0.9, top_k=50, max_length=128):
+  def generate(self, encoding, temperature=0.7, top_p=0.9, max_length=128):
     """
     Generates an original sonnet using top-p sampling and softmax temperature.
 
@@ -150,16 +98,6 @@ class SonnetGPT(nn.Module):
 
       # Convert logits to probabilities
       probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
-
-      # (TODO ADDRESSED)
-      if top_k > 0:
-          # get the top k probabilities and their thresholds
-          top_k_probs, _ = torch.topk(probs, top_k, dim=-1)
-          min_top_k_prob = top_k_probs[..., -1, None]
-          # zero out anything below the threshold
-          probs = torch.where(probs < min_top_k_prob, torch.zeros_like(probs), probs)
-          # re-normalize
-          probs /= probs.sum(dim=-1, keepdim=True)
 
       # Top-p (nucleus) sampling
       sorted_probs, sorted_indices = torch.sort(probs, descending=True)
@@ -220,11 +158,6 @@ def train(args):
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr)
 
-  # early stopping vars
-  best_loss = float('inf')
-  patience = 3 # stop after 3 epochs of no improvement
-  patience_counter = 0
-
   # Run for the specified number of epochs.
   for epoch in range(args.epochs):
     model.train()
@@ -251,24 +184,6 @@ def train(args):
 
     train_loss = train_loss / num_batches
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}.")
-
-    # (TODO ADDRESSED)
-    if train_loss < best_loss:
-        best_loss = train_loss
-        patience_counter = 0
-        
-        # only save the model when we hit a new best loss
-        dir_name = os.path.dirname(args.filepath)
-        base_name = os.path.basename(args.filepath)
-        best_save_path = os.path.join(dir_name, f"best_{base_name}")
-        save_model(model, optimizer, args, best_save_path)
-        print("New best model saved!")
-    else:
-        patience_counter += 1
-        if patience_counter >= patience:
-            print(f"Stopping early at epoch {epoch} to prevent overfitting.")
-            break
-
     print('Generating several output sonnets...')
     model.eval()
     for batch in held_out_sonnet_dataset:
@@ -277,20 +192,13 @@ def train(args):
       print(f'{batch[1]}{output[1]}\n\n')
 
     # TODO: consider a stopping condition to prevent overfitting on the small dataset of sonnets.
-    # dir_name = os.path.dirname(args.filepath) # /root/results
-    # base_name = os.path.basename(args.filepath) # sonnet.pt
-    # current_save_path = os.path.join(dir_name, f"{epoch}_{base_name}")
-    # save_model(model, optimizer, args, current_save_path)
+    save_model(model, optimizer, args, f'{epoch}_{args.filepath}')
 
 
 @torch.no_grad()
 def generate_submission_sonnets(args):
-  dir_name = os.path.dirname(args.filepath)
-  base_name = os.path.basename(args.filepath)
-  load_path = os.path.join(dir_name, f"best_{base_name}")
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(load_path, weights_only=False)
-  # saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+  saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
 
   model = SonnetGPT(saved['args'])
   model.load_state_dict(saved['model'])
@@ -323,7 +231,7 @@ def get_args():
 
   parser.add_argument("--sonnet_path", type=str, default="data/sonnets.txt")
   parser.add_argument("--held_out_sonnet_path", type=str, default="data/sonnets_held_out.txt")
-  parser.add_argument("--sonnet_out", type=str, default="predictions/generated_sonnets.txt")
+  parser.add_argument("--sonnet_out", type=str, default="predictions/generated_sonnets_dev.txt")
 
   parser.add_argument("--seed", type=int, default=11711)
   parser.add_argument("--epochs", type=int, default=10)
@@ -339,7 +247,7 @@ def get_args():
   parser.add_argument("--model_size", type=str, help="The model size as specified on hugging face.",
                       choices=['gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'], default='gpt2')
 
-  args = parser.parse_args()
+  args, _ = parser.parse_known_args()
   return args
 
 
@@ -361,17 +269,70 @@ def add_arguments(args):
     raise Exception(f'{args.model_size} is not supported.')
   return args
 
+app = modal.App("sonnet-generator")
 
-if __name__ == "__main__":
-    args = get_args()
+# define environment
+image = (
+    modal.Image.debian_slim()
+    .pip_install("torch", "torchvision", "torchaudio", "tqdm==4.58.0", "requests==2.25.1", "importlib-metadata==3.7.0", "filelock==3.0.12", "sklearn==0.0", "tokenizers==0.20", "explainaboard-client==0.0.7", "einops==0.8.0", "transformers==4.46.3", "sacrebleu==2.5.1", "matplotlib>=3.7.5", "pronouncing>=0.2.0")
+    .env({"PYTHONPATH": "/root/project"})
+    .add_local_dir("data", remote_path="/root/project/data", ignore=["*.pt", "__pycache__", ".venv"])
+    .add_local_dir("models", remote_path="/root/project/models", ignore=["*.pt", "__pycache__", ".venv"])
+    .add_local_dir("modules", remote_path="/root/project/modules", ignore=["*.pt", "__pycache__", ".venv"])
+    .add_local_file("classifier.py", remote_path="/root/project/classifier.py")
+    .add_local_file("config.py", remote_path="/root/project/config.py")
+    .add_local_file("datasets.py", remote_path="/root/project/datasets.py")
+    .add_local_file("evaluation.py", remote_path="/root/project/evaluation.py")
+    .add_local_file("optimizer.py", remote_path="/root/project/optimizer.py")
+    .add_local_file("sonnet_generation.py", remote_path="/root/project/sonnet_generation.py")
+    .add_local_file("utils.py", remote_path="/root/project/utils.py")
+)
+
+@app.function(
+    image=image,     # local dir is now attached via image
+    gpu="any",       # requests any available GPU
+    timeout=3600     # 1h timeout
+)
+def run_on_modal(args):
+    # move into the mounted directory so relative paths work
+    os.chdir("/root/project")
+    
+    # ensure the remote output directory exists
+    os.makedirs(os.path.dirname(args.sonnet_out), exist_ok=True)
+    
+    # force GPU usage and set the filepath
+    args.use_gpu = True
     args.filepath = f'{args.epochs}-{args.lr}-sonnet.pt'
     
-    if modal.is_local():
-        print("Launching on Modal GPU...")
-        with app.run():
-            train_remote.remote(vars(args)) # trigger modal w remote
-    else:
-        # run this inside cloud container
-        seed_everything(args.seed)
-        train(args)
-        generate_submission_sonnets(args)
+    # run original pipeline
+    seed_everything(args.seed)
+    train(args)
+    generate_submission_sonnets(args)
+    
+    # read the generated outputs to return them to local machine
+    with open(args.sonnet_out, "r") as f:
+        generated_sonnets = f.read()
+        
+    final_model_path = f"{args.epochs-1}_{args.filepath}"
+    with open(final_model_path, "rb") as f:
+        model_weights = f.read()
+        
+    return generated_sonnets, model_weights, final_model_path
+
+@app.local_entrypoint()
+def main():
+    args = get_args()
+    print("Starting to train...")
+    
+    # run on modal
+    generated_sonnets, model_weights, model_name = run_on_modal.remote(args)
+    
+    # write the results back to local machine for evals
+    os.makedirs(os.path.dirname(args.sonnet_out), exist_ok=True)
+    with open(args.sonnet_out, "w") as f:
+        f.write(generated_sonnets)
+        
+    with open(model_name, "wb") as f:
+        f.write(model_weights)
+        
+    print(f"Saved generated sonnets to {args.sonnet_out} and model weights to {model_name}")
