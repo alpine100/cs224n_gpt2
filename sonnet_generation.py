@@ -27,12 +27,11 @@ from models.gpt2 import GPT2Model
 
 from optimizer import AdamW
 
-# Modal imports
+TQDM_DISABLE = False
+
 import modal
 import os
 from argparse import Namespace
-
-TQDM_DISABLE = False
 
 # set up modal app
 app = modal.App("sonnet-generator")
@@ -40,16 +39,17 @@ volume = modal.Volume.from_name("sonnet-results", create_if_missing=True)
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch", "transformers", "einops", "tqdm", "numpy", "importlib-metadata", "requests", "pronouncing")
+    .pip_install("torch", "transformers", "einops", "tqdm", "numpy", "importlib-metadata", "requests")
     .add_local_dir(".", remote_path="/root", copy=False) 
 )
 
 @app.function(
-    gpu="A10G",
+    gpu="H100",
     image=image,
     volumes={"/root/results": volume},
     timeout=3600
 )
+
 def train_remote(args_dict):
     args = Namespace(**args_dict)
     os.chdir("/root")
@@ -68,7 +68,6 @@ def train_remote(args_dict):
     
     volume.commit() 
     print("Training complete and files saved to Volume.")
-
 
 # Fix the random seed.
 def seed_everything(seed=11711):
@@ -90,14 +89,24 @@ class SonnetGPT(nn.Module):
     self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
     self.tokenizer.pad_token = self.tokenizer.eos_token
 
-    self.lm_head = nn.Linear(args.d, len(self.tokenizer), bias=False)
+    # By default, fine-tune the full model. TODO: this is maybe not idea. (TODO ADDRESSED)
+    for param in self.gpt.parameters():
+      param.requires_grad = False
 
-    # By default, fine-tune the full model. TODO: this is maybe not idea.
-    for name, param in self.gpt.named_parameters():
-      if 'wte' in name or 'wpe' in name:
-        param.requires_grad = False
-      else:
+    # unfreeze only the last 2 transformer blocks
+    blocks_to_unfreeze = 2
+    for layer in self.gpt.gpt_layers[-blocks_to_unfreeze:]:
+      for param in layer.parameters():
         param.requires_grad = True
+
+    # unfreeze the final layer norm 
+    for param in self.gpt.final_layer_norm.parameters():
+      param.requires_grad = True
+      
+    # bc GPT-2 ties its output LM head weights to the input word embeddings 
+    # (see hidden_state_to_token) also unfreeze the word embeddings.
+    for param in self.gpt.word_embedding.parameters():
+      param.requires_grad = True
 
   def forward(self, input_ids, attention_mask):
     """
@@ -106,16 +115,16 @@ class SonnetGPT(nn.Module):
     not just the distribution over next tokens for the last token!
     """
     ### YOUR CODE HERE
+    # pass the inputs through the base GPT-2 model
     outputs = self.gpt(input_ids, attention_mask)
-    
-    # Extract the hidden states tensor from the dictionary
-    hidden_states = outputs["last_hidden_state"]
-    
-    # Pass the tensor through the linear head
-    logits = self.lm_head(hidden_states)
-    
-    return logits
 
+    # extract hidden states for all tokens
+    all_hidden_states = outputs["last_hidden_state"]
+
+    # project hidden states back to vocab size to get logits
+    logits = self.gpt.hidden_state_to_token(all_hidden_states)
+
+    return logits
 
   def get_device(self):
     for param in self.gpt.parameters():
@@ -139,13 +148,18 @@ class SonnetGPT(nn.Module):
       logits_sequence = self.forward(token_ids, attention_mask)
       logits_last_token = logits_sequence[:, -1, :] / temperature  # Apply temperature scaling
 
-      if top_k > 0:
-        top_k_vals, _ = torch.topk(logits_last_token, min(top_k, logits_last_token.size(-1)))
-        min_top_k_val = top_k_vals[:, [-1]]
-        logits_last_token[logits_last_token < min_top_k_val] = -float('Inf')
-
       # Convert logits to probabilities
       probs = torch.nn.functional.softmax(logits_last_token, dim=-1)
+
+      # (TODO ADDRESSED)
+      if top_k > 0:
+          # get the top k probabilities and their thresholds
+          top_k_probs, _ = torch.topk(probs, top_k, dim=-1)
+          min_top_k_prob = top_k_probs[..., -1, None]
+          # zero out anything below the threshold
+          probs = torch.where(probs < min_top_k_prob, torch.zeros_like(probs), probs)
+          # re-normalize
+          probs /= probs.sum(dim=-1, keepdim=True)
 
       # Top-p (nucleus) sampling
       sorted_probs, sorted_indices = torch.sort(probs, descending=True)
@@ -206,7 +220,9 @@ def train(args):
   lr = args.lr
   optimizer = AdamW(model.parameters(), lr=lr)
 
-  best_train_loss = float('inf')
+  # early stopping vars
+  best_loss = float('inf')
+  patience = 3 # stop after 3 epochs of no improvement
   patience_counter = 0
 
   # Run for the specified number of epochs.
@@ -235,6 +251,24 @@ def train(args):
 
     train_loss = train_loss / num_batches
     print(f"Epoch {epoch}: train loss :: {train_loss :.3f}.")
+
+    # (TODO ADDRESSED)
+    if train_loss < best_loss:
+        best_loss = train_loss
+        patience_counter = 0
+        
+        # only save the model when we hit a new best loss
+        dir_name = os.path.dirname(args.filepath)
+        base_name = os.path.basename(args.filepath)
+        best_save_path = os.path.join(dir_name, f"best_{base_name}")
+        save_model(model, optimizer, args, best_save_path)
+        print("New best model saved!")
+    else:
+        patience_counter += 1
+        if patience_counter >= patience:
+            print(f"Stopping early at epoch {epoch} to prevent overfitting.")
+            break
+
     print('Generating several output sonnets...')
     model.eval()
     for batch in held_out_sonnet_dataset:
@@ -243,26 +277,20 @@ def train(args):
       print(f'{batch[1]}{output[1]}\n\n')
 
     # TODO: consider a stopping condition to prevent overfitting on the small dataset of sonnets.
-    dir_name = os.path.dirname(args.filepath)
-    base_name = os.path.basename(args.filepath)
-    current_save_path = os.path.join(dir_name, f"{epoch}_{base_name}")
-    save_model(model, optimizer, args, current_save_path)
-    
-    if train_loss < best_train_loss - 0.01:
-      best_train_loss = train_loss
-      patience_counter = 0
-    else:
-      patience_counter += 1
-
-    if patience_counter >= 3:
-      print(f"Stopping early at epoch {epoch} to prevent overfitting (loss plateaued).")
-      break
+    # dir_name = os.path.dirname(args.filepath) # /root/results
+    # base_name = os.path.basename(args.filepath) # sonnet.pt
+    # current_save_path = os.path.join(dir_name, f"{epoch}_{base_name}")
+    # save_model(model, optimizer, args, current_save_path)
 
 
 @torch.no_grad()
 def generate_submission_sonnets(args):
+  dir_name = os.path.dirname(args.filepath)
+  base_name = os.path.basename(args.filepath)
+  load_path = os.path.join(dir_name, f"best_{base_name}")
   device = torch.device('cuda') if args.use_gpu else torch.device('cpu')
-  saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
+  saved = torch.load(load_path, weights_only=False)
+  # saved = torch.load(f'{args.epochs-1}_{args.filepath}', weights_only=False)
 
   model = SonnetGPT(saved['args'])
   model.load_state_dict(saved['model'])
@@ -340,7 +368,7 @@ if __name__ == "__main__":
     
     if modal.is_local():
         print("Launching on Modal GPU...")
-        with app.run(detach=True):
+        with app.run():
             train_remote.remote(vars(args)) # trigger modal w remote
     else:
         # run this inside cloud container
