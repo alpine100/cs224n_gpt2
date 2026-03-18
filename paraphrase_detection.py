@@ -251,7 +251,7 @@ def benchmark_run(args, label):
         torch.cuda.synchronize()
 
         latency_ms = start.elapsed_time(end)
-        peak_mem_bytes = torch.cuda.max_memory_allocated(device)  # ADD THIS
+        peak_mem_bytes = torch.cuda.max_memory_allocated(device)  
         memory_bandwidth_tbs = (peak_mem_bytes / (latency_ms / 1000)) / 1e12  # bytes -> TB/s
 
         tokens_per_sec = (batch_size * seq_len) / (latency_ms / 1000)
@@ -287,7 +287,7 @@ def benchmark(args):
 
     plot_benchmark(flash_results, normal_results, longformer_results)
 
-
+# used AI as collaborator to brainstorm matplotlib plot structure
 def plot_benchmark(flash_results, normal_results, longformer_results):
     all_runs = [
         (flash_results,      'flash',      'steelblue',  'o'),
@@ -298,7 +298,7 @@ def plot_benchmark(flash_results, normal_results, longformer_results):
     metrics = [
         ("latency_ms",           "Latency (ms)",        "Latency vs Sequence Length"),
         ("tflops",               "TFLOP/s",             "Compute Throughput vs Sequence Length"),
-        ("memory_bandwidth_tbs", "Memory BW (TB/s)",    "Memory Bandwidth vs Sequence Length"),  # NEW
+        ("memory_bandwidth_tbs", "Memory BW (TB/s)",    "Memory Bandwidth vs Sequence Length"),  
         ("tokens_per_sec",       "Tokens / Second",     "Tokens per Second vs Sequence Length"),
     ]
 

@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+#shoutout to TA's and our mentor for suggesting Triton docs related to offsets, coalescing
 #from triton.tools.tensor_descriptor import TensorDescriptor
 
 #DEVICE = triton.runtime.driver.active.get_active_torch_function()

@@ -317,6 +317,8 @@ def benchmark(args):
   plot_benchmark(flash_results, normal_results, longformer_results)
 
 
+# used Gemini as collaborator to brainstorm matplotlib plot structure
+# Can't remember syntax for (slightly) more sophisticated plots ...
 def plot_benchmark(flash_results, normal_results, longformer_results):
   all_runs = [
     (flash_results,      'flash',      'steelblue',  'o'),

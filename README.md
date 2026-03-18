@@ -1,3 +1,24 @@
+## Default Project Extension:
+To generate flash attention benchmarks (default seq length up to 100k+ tokens), 
+cd into modules and run flash_attention.py
+Must be in a unix environment with GPU support enabled for triton to work. 
+
+Optimal Block/Tiling Sizes vs Latency (we find that default of 64 is the best):
+![alt text](output/plots/triton_latency_bars_Forward_log.png)
+![alt text](output/plots/triton_latency_bars_Backward_log.png)
+
+
+Our benchmarks initially outperform built in Pytorch SDPA for powers-of-2 sequence lengths up to 130k.
+![alt text](<output/L4/Detailed benchmark_forward_pass.png>)
+![alt text](<output/L4/Detailed benchmark_back_prop.png>)
+
+When we benchmarked on sonnet generation and paraphrase dev, however, the results matched PyTorch SDPA and longformer for paraphrase. For sonnet generation, however, this slightly underperformed. 
+![alt text](output/L4/Paraphrase_Benchmark_Results_L4.png)
+![alt text](output/L4/Sonnet_Benchmark_Results.png)
+
+Sonnet generation, even for default SDPA latency and bandwidth were not inverse of each other but rather the same. Also latency and bandwidth dropped around 160 tokens. We suspect this is due to unequal allocation of the SM's on the Nvidia GPU's resulting in warp divergence. 
+
+
 # CS 224N Default Final Project: Build GPT-2
 
 This is the default final project for the Stanford CS 224N class. Please refer to the project handout on the course
@@ -52,8 +73,3 @@ References: https://web.stanford.edu/class/cs224n/project/DFP_Instructions.pdf
 
 Parts of the code are from the [`transformers`](https://github.com/huggingface/transformers)
 library ([Apache License 2.0](./LICENSE)).
-
-## Default Project:
-To generate flash attention benchmarks (default seq length up to 100k+ tokens), 
-cd into modules and run flash_attention.py
-Must be in a unix environment with GPU support enabled for triton to work. 
